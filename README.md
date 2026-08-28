@@ -57,9 +57,12 @@ bun run index.ts --watch --threshold 80   # デフォルト 300秒
 bun run index.ts --calendar
 bun run index.ts --calendar --calendar-open        # ブラウザでテンプレートを開く
 bun run index.ts --calendar --calendar-out ./my.ics
-# API で直接登録 (要 OAuth トークン)
+# API で直接登録 (一時トークン)
 GOOGLE_OAUTH_TOKEN="$(gcloud auth print-access-token)" bun run index.ts --calendar --calendar-api
 GOOGLE_OAUTH_TOKEN="ya29..." bun run index.ts --calendar --calendar-api --calendar-id primary
+# API で永続登録 (refresh_token 保存、推奨)
+GOOGLE_CLIENT_ID="xxx.apps.googleusercontent.com" GOOGLE_CLIENT_SECRET="GOCSPX-xxx" bun run index.ts --calendar-auth
+bun run index.ts --calendar --calendar-api         # 以降トークン指定なしで自動リフレッシュ
 
 # npm scripts エイリアス
 bun run start       # == bun run index.ts
@@ -81,8 +84,10 @@ bun run watch       # --watch 300 --notify
 --calendar                      リセット時刻を Google Calendar 用に ICS + URL 生成
 --calendar-out <path>           ICS 出力先 (デフォ: ccusage-reset.ics)
 --calendar-open                 Google Calendar テンプレート URL をブラウザで開く
---calendar-api                  Google Calendar API で直接登録 (要 GOOGLE_OAUTH_TOKEN)
+--calendar-api                  Google Calendar API で直接登録 (要 GOOGLE_OAUTH_TOKEN または保存済み refresh_token)
 --calendar-id <id>              対象カレンダー ID (デフォ: primary)
+--calendar-auth                 Google Calendar OAuthフロー開始 (要 GOOGLE_CLIENT_ID/SECRET)
+--calendar-auth-port <port>     コールバック用ローカルポート (デフォ: 8085)
 -h, --help                      ヘルプ
 ```
 
@@ -97,13 +102,28 @@ export CLAUDE_TOKEN="sk-ant-oat01-..."
 
 設定時は Keychain 読み取りをスキップします。Linux / CI 向け。
 
-Google Calendar API を使う場合:
+Google Calendar API を使う場合（一時トークン）:
 
 ```bash
 export GOOGLE_OAUTH_TOKEN="ya29...."  # もしくは GOOGLE_CALENDAR_TOKEN / GOOGLE_ACCESS_TOKEN
 export GOOGLE_CALENDAR_ID="primary"   # 省略時は primary
 # gcloud が入っている場合:
 export GOOGLE_OAUTH_TOKEN="$(gcloud auth print-access-token)"
+```
+
+永続化する場合（推奨、refresh_token 保存）:
+
+```bash
+export GOOGLE_CLIENT_ID="xxx.apps.googleusercontent.com"
+export GOOGLE_CLIENT_SECRET="GOCSPX-xxx"
+# 既に refresh_token を持つ場合
+export GOOGLE_REFRESH_TOKEN="1//0g..."
+# 初回はブラウザで認証して保存 (access + refresh を ~/.config/ccusage-notifier/google-calendar-token.json に 600 で保存)
+GOOGLE_CLIENT_ID="..." GOOGLE_CLIENT_SECRET="..." bun run index.ts --calendar-auth
+# 以降は env なしで自動リフレッシュ
+bun run index.ts --calendar --calendar-api
+# 保存先: ~/.config/ccusage-notifier/google-calendar-token.json (XDG_CONFIG_HOME/ccusage-notifier/)
+# 代替: ~/.ccusage-notifier-google-token.json / ./.google-calendar-token.json も参照
 ```
 
 必要スコープ: `https://www.googleapis.com/auth/calendar.events`
@@ -150,7 +170,7 @@ END:VEVENT
 END:VCALENDAR
 ```
 
-### 方法3: Google Calendar API で自動登録 (要 OAuth)
+### 方法3: Google Calendar API で自動登録 (一時トークン、要 OAuth)
 
 GCP で OAuth 同意画面とカレンダー API を有効化し、トークンを取得してください:
 
@@ -159,7 +179,7 @@ GCP で OAuth 同意画面とカレンダー API を有効化し、トークン�
 gcloud auth login --scopes=https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/cloud-platform
 GOOGLE_OAUTH_TOKEN="$(gcloud auth print-access-token)" bun run index.ts --calendar --calendar-api
 
-# または自前の OAuth トークン
+# または自前の OAuth トークン (1時間で失効)
 GOOGLE_OAUTH_TOKEN="ya29...." bun run index.ts --calendar --calendar-api --calendar-id primary
 ```
 
@@ -171,7 +191,43 @@ GOOGLE_OAUTH_TOKEN="ya29...." bun run index.ts --calendar --calendar-api --calen
   ✓ Claude Code weekly limit reset -> https://www.google.com/calendar/event?eid=...
 ```
 
-API を使わずに手動で登録したい場合は方法1/2を使ってください。
+### 方法4: Google Calendar API で永続登録 (推奨、refresh_token)
+
+`access_token` は1時間で失効するため、継続利用には `refresh_token` を保存します。`index.ts:411` の `getGoogleAccessToken` が `expires_at` を見て自動リフレッシュします。
+
+```bash
+# 1. GCPで OAuthクライアント作成
+#    https://console.cloud.google.com/auth/clients
+#    - 種類: デスクトップアプリ (またはウェブで http://localhost:8085/callback を登録)
+#    - 同意画面でスコープ https://www.googleapis.com/auth/calendar.events とテストユーザーを追加
+
+# 2. 認証フロー開始 (ブラウザが開く)
+GOOGLE_CLIENT_ID="xxx.apps.googleusercontent.com" GOOGLE_CLIENT_SECRET="GOCSPX-xxx" bun run index.ts --calendar-auth
+# または npm script
+GOOGLE_CLIENT_ID="..." GOOGLE_CLIENT_SECRET="..." bun run calendar:auth
+# -> 許可後に ~/.config/ccusage-notifier/google-calendar-token.json (600) に保存
+
+# 3. 以降はトークン指定なしで登録 (期限切れは自動リフレッシュ)
+bun run index.ts --calendar --calendar-api
+bun run calendar:api
+
+# 手動で refresh_token から直接保存したい場合
+GOOGLE_REFRESH_TOKEN="1//0g..." GOOGLE_CLIENT_ID="..." GOOGLE_CLIENT_SECRET="..." bun run index.ts --calendar --calendar-api
+# -> その場で refresh してファイルに保存
+
+# 定期実行例
+bun run index.ts --watch 3600 --calendar --calendar-api
+```
+
+保存先と優先順位:
+
+1. `GOOGLE_REFRESH_TOKEN` + `GOOGLE_CLIENT_ID/SECRET` があればその場でリフレッシュして保存
+2. `GOOGLE_OAUTH_TOKEN` env があればそれを使用（一時的、Playground等）
+3. `~/.config/ccusage-notifier/google-calendar-token.json` / `~/.ccusage-notifier-google-token.json` / `./.google-calendar-token.json` の順で読み込み、期限切れなら `refresh_token` で自動更新
+
+**注意:** OAuth同意画面が `テスト` モードの場合、`refresh_token` は7日で失効します（`refresh_token_expires_in: 604799`）。`本番環境` に公開するか、7日ごとに `bun run calendar:auth` で再認証してください。`--calendar` の `resets_at` は取得時点のスナップショットなので、時間経過で変わる場合は再実行してください。
+
+他の方法で手動登録したい場合は方法1/2を使ってください。
 
 ## ライブラリとして使う
 
