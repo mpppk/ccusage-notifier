@@ -183,12 +183,12 @@ GOOGLE_OAUTH_TOKEN="$(gcloud auth print-access-token)" bun run index.ts --calend
 GOOGLE_OAUTH_TOKEN="ya29...." bun run index.ts --calendar --calendar-api --calendar-id primary
 ```
 
-成功すると `htmlLink` が出力されます:
+成功すると `htmlLink` が出力されます（既存イベントがある場合は移動/更新、重複は自動削除）:
 
 ```
-[calendar] Inserting 2 event(s) via API to calendar: primary
-  ✓ Claude Code 5-hour limit reset -> https://www.google.com/calendar/event?eid=...
-  ✓ Claude Code weekly limit reset -> https://www.google.com/calendar/event?eid=...
+[calendar] Upserting 2 event(s) via API to calendar: primary (existing events will be moved)
+  ✓ Claude Code 5-hour limit reset [moved] -> https://www.google.com/calendar/event?eid=...
+  ✓ Claude Code weekly limit reset [updated (already at correct time)] -> https://www.google.com/calendar/event?eid=...
 ```
 
 ### 方法4: Google Calendar API で永続登録 (推奨、refresh_token)
@@ -225,6 +225,8 @@ bun run index.ts --watch 3600 --calendar --calendar-api
 2. `GOOGLE_OAUTH_TOKEN` env があればそれを使用（一時的、Playground等）
 3. `~/.config/ccusage-notifier/google-calendar-token.json` / `~/.ccusage-notifier-google-token.json` / `./.google-calendar-token.json` の順で読み込み、期限切れなら `refresh_token` で自動更新
 
+**既存予定の扱い (5h limit 更新時):** `index.ts:408` の `upsertGoogleCalendarEvent` が `q=Claude Code` で既存イベントを検索し、`extendedProperties.private.source=ccusage-notifier` + `summary` で `five_hour` / `weekly` を判別して `PATCH` で新時刻へ移動します。重複があれば先頭1件を残して他を `DELETE` で自動クリーンアップします。初回以降は毎回同じイベントが移動されるため、重複は増えません。ICSは毎回上書きされます。
+
 **注意:** OAuth同意画面が `テスト` モードの場合、`refresh_token` は7日で失効します（`refresh_token_expires_in: 604799`）。`本番環境` に公開するか、7日ごとに `bun run calendar:auth` で再認証してください。`--calendar` の `resets_at` は取得時点のスナップショットなので、時間経過で変わる場合は再実行してください。
 
 他の方法で手動登録したい場合は方法1/2を使ってください。
@@ -252,7 +254,7 @@ console.log(generateIcs(events)); // ICS 文字列
 - ポーリング間隔を 60秒未満にすると `429 Rate limited` になることがあります。推奨は 300秒以上。
 - `security` コマンドは macOS 専用です。Linux では環境変数でトークンを渡してください。
 - Keychain アクセスで `Could not read Claude Code credentials` が出る場合は、Claude Code にログイン済みか確認してください。
-- Google Calendar のリセット時刻は取得時点の `resets_at` のスナップショットです。時間経過で変わるため、定期的に `bun run index.ts --calendar` を再実行して再登録してください。`--watch` と組み合わせると毎回 ICS が上書きされます。
+- Google Calendar のリセット時刻は取得時点の `resets_at` のスナップショットです。時間経過で変わるため、定期的に `bun run index.ts --calendar --calendar-api` を再実行してください。既存予定は自動で新時刻へ移動（`PATCH`）され、重複は削除されます。`--watch` と組み合わせると毎回チェックされ、時刻変更時のみ移動します。
 
 ## 開発
 

@@ -37,7 +37,7 @@ test("shouldNotify triggers on critical limit", () => {
   expect(res.reasons.join(" ")).toContain("critical");
 });
 
-test("buildCalendarEvents creates 2 events", () => {
+test("buildCalendarEvents creates 2 events with kind", () => {
   const usage = {
     five_hour: { utilization: 100, resets_at: "2026-08-28T14:39:59.766841+00:00" },
     seven_day: { utilization: 44, resets_at: "2026-09-02T18:59:59.766865+00:00" },
@@ -46,7 +46,9 @@ test("buildCalendarEvents creates 2 events", () => {
   const events = buildCalendarEvents(usage);
   expect(events.length).toBe(2);
   expect(events[0]!.summary).toContain("5-hour");
+  expect(events[0]!.kind).toBe("five_hour");
   expect(events[1]!.summary).toContain("weekly");
+  expect(events[1]!.kind).toBe("weekly");
 });
 
 test("buildGoogleCalendarUrl formats correctly", () => {
