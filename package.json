@@ -1,0 +1,22 @@
+{
+  "name": "ccusage-notifier",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "ccusage-notifier": "./index.ts"
+  },
+  "scripts": {
+    "start": "bun run index.ts",
+    "dev": "bun --watch run index.ts",
+    "check": "bun run index.ts --json",
+    "notify": "bun run index.ts --notify --threshold 80",
+    "watch": "bun run index.ts --watch 300 --notify"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
