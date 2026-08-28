@@ -7,8 +7,9 @@ Claude Code の利用量 (`5-hour` / `7-day`) を Anthropic OAuth API (`https://
 - macOS Keychain (`security find-generic-password -s "Claude Code-credentials"`) からトークン自動取得 (`index.ts:54`)
 - `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_OAUTH_TOKEN` / `CLAUDE_TOKEN` 環境変数での上書き
 - 見やすい整形表示 + バー表示 + JST/UTC リセット時刻 (`index.ts:103`)
-- 閾値超過時の macOS 通知 (`osascript display notification`) (`index.ts:168`)
+- 閾値超過時の macOS 通知 (`osascript display notification`) (`index.ts:280`)
 - `--watch` ポーリング + `--json` 生出力
+- Google Calendar 連携: リセット時刻を ICS / Google Calendar URL / Calendar API で登録 (`index.ts:230`)
 
 ## 検証済み
 
@@ -52,6 +53,14 @@ bun run index.ts --notify --threshold-five 70 --threshold-week 80
 bun run index.ts --watch 300 --notify
 bun run index.ts --watch --threshold 80   # デフォルト 300秒
 
+# リセット時刻を Google カレンダーに登録 (ICS + URL 生成)
+bun run index.ts --calendar
+bun run index.ts --calendar --calendar-open        # ブラウザでテンプレートを開く
+bun run index.ts --calendar --calendar-out ./my.ics
+# API で直接登録 (要 OAuth トークン)
+GOOGLE_OAUTH_TOKEN="$(gcloud auth print-access-token)" bun run index.ts --calendar --calendar-api
+GOOGLE_OAUTH_TOKEN="ya29..." bun run index.ts --calendar --calendar-api --calendar-id primary
+
 # npm scripts エイリアス
 bun run start       # == bun run index.ts
 bun run check       # --json
@@ -69,6 +78,11 @@ bun run watch       # --watch 300 --notify
 --threshold-week <n>            7日閾値
 --watch [sec]                   ポーリング間隔秒 (デフォ 300)
 --interval <sec>                --watch のエイリアス
+--calendar                      リセット時刻を Google Calendar 用に ICS + URL 生成
+--calendar-out <path>           ICS 出力先 (デフォ: ccusage-reset.ics)
+--calendar-open                 Google Calendar テンプレート URL をブラウザで開く
+--calendar-api                  Google Calendar API で直接登録 (要 GOOGLE_OAUTH_TOKEN)
+--calendar-id <id>              対象カレンダー ID (デフォ: primary)
 -h, --help                      ヘルプ
 ```
 
@@ -83,10 +97,86 @@ export CLAUDE_TOKEN="sk-ant-oat01-..."
 
 設定時は Keychain 読み取りをスキップします。Linux / CI 向け。
 
+Google Calendar API を使う場合:
+
+```bash
+export GOOGLE_OAUTH_TOKEN="ya29...."  # もしくは GOOGLE_CALENDAR_TOKEN / GOOGLE_ACCESS_TOKEN
+export GOOGLE_CALENDAR_ID="primary"   # 省略時は primary
+# gcloud が入っている場合:
+export GOOGLE_OAUTH_TOKEN="$(gcloud auth print-access-token)"
+```
+
+必要スコープ: `https://www.googleapis.com/auth/calendar.events`
+
+## Google カレンダー連携の詳細
+
+### 方法1: ワンクリック登録 (推奨・認証不要)
+
+```bash
+bun run index.ts --calendar
+# 出力される Google Calendar URL をブラウザで開く
+# 例: https://calendar.google.com/calendar/render?action=TEMPLATE&text=Claude+Code+5-hour+limit+reset&dates=20260828T143959Z/20260828T145459Z&...
+
+# 自動でブラウザを開く
+bun run index.ts --calendar --calendar-open
+```
+
+`--calendar` は `five_hour.resets_at` / `seven_day.resets_at` それぞれについて:
+- Google Calendar テンプレート URL を表示
+- `ccusage-reset.ics` (ICS) を生成
+
+ICS は `Google Calendar > 設定 > インポート/エクスポート > インポート` から取り込むか、ICS ファイルを Google Calendar の Web UI にドラッグ&ドロップで登録できます。
+
+### 方法2: ICS ファイルを直接インポート
+
+```bash
+bun run index.ts --calendar --calendar-out ./reset.ics
+# -> ./reset.ics を Google Calendar にインポート
+```
+
+ICS 中身例:
+
+```
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//ccusage-notifier//EN
+BEGIN:VEVENT
+UID:20260828T143959Z-Claude-Code-5-hour-limit-reset@ccusage-notifier
+DTSTART:20260828T143959Z
+DTEND:20260828T145459Z
+SUMMARY:Claude Code 5-hour limit reset
+...
+END:VEVENT
+END:VCALENDAR
+```
+
+### 方法3: Google Calendar API で自動登録 (要 OAuth)
+
+GCP で OAuth 同意画面とカレンダー API を有効化し、トークンを取得してください:
+
+```bash
+# gcloud 経由が最短 (Calendar scope が必要)
+gcloud auth login --scopes=https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/cloud-platform
+GOOGLE_OAUTH_TOKEN="$(gcloud auth print-access-token)" bun run index.ts --calendar --calendar-api
+
+# または自前の OAuth トークン
+GOOGLE_OAUTH_TOKEN="ya29...." bun run index.ts --calendar --calendar-api --calendar-id primary
+```
+
+成功すると `htmlLink` が出力されます:
+
+```
+[calendar] Inserting 2 event(s) via API to calendar: primary
+  ✓ Claude Code 5-hour limit reset -> https://www.google.com/calendar/event?eid=...
+  ✓ Claude Code weekly limit reset -> https://www.google.com/calendar/event?eid=...
+```
+
+API を使わずに手動で登録したい場合は方法1/2を使ってください。
+
 ## ライブラリとして使う
 
 ```ts
-import { getClaudeToken, getClaudeUsage, formatUsage, shouldNotify } from "./index.ts";
+import { getClaudeToken, getClaudeUsage, formatUsage, shouldNotify, buildCalendarEvents, buildGoogleCalendarUrl, generateIcs } from "./index.ts";
 
 const token = await getClaudeToken();
 const usage = await getClaudeUsage(token);
@@ -94,6 +184,11 @@ console.log(formatUsage(usage));
 
 const { notify, reasons } = shouldNotify(usage, 80, 80);
 if (notify) console.log("alert:", reasons);
+
+// Calendar
+const events = buildCalendarEvents(usage);
+console.log(buildGoogleCalendarUrl(events[0]!)); // URL
+console.log(generateIcs(events)); // ICS 文字列
 ```
 
 ## 注意
@@ -101,6 +196,7 @@ if (notify) console.log("alert:", reasons);
 - ポーリング間隔を 60秒未満にすると `429 Rate limited` になることがあります。推奨は 300秒以上。
 - `security` コマンドは macOS 専用です。Linux では環境変数でトークンを渡してください。
 - Keychain アクセスで `Could not read Claude Code credentials` が出る場合は、Claude Code にログイン済みか確認してください。
+- Google Calendar のリセット時刻は取得時点の `resets_at` のスナップショットです。時間経過で変わるため、定期的に `bun run index.ts --calendar` を再実行して再登録してください。`--watch` と組み合わせると毎回 ICS が上書きされます。
 
 ## 開発
 
