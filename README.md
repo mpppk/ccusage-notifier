@@ -227,7 +227,7 @@ bun run index.ts --watch 3600 --calendar --calendar-api
 
 **既存予定の扱い (5h limit 更新時):** `index.ts:408` の `upsertGoogleCalendarEvent` が `q=Claude Code` で既存イベントを検索し、`extendedProperties.private.source=ccusage-notifier` + `summary` で `five_hour` / `weekly` を判別して `PATCH` で新時刻へ移動します。重複があれば先頭1件を残して他を `DELETE` で自動クリーンアップします。初回以降は毎回同じイベントが移動されるため、重複は増えません。ICSは毎回上書きされます。
 
-`resets_at` が `null` の場合（例: 5-hour が `0%` でリセット不要）は、該当 `kind` の既存予定を `DELETE` で自動削除します。`five_hour` が `0%` / `null` になった今回のケースでは、古い5-hour予定が削除され weekly のみが残ります。
+`resets_at` が `null` の場合、従来は該当 `kind` の既存予定を `DELETE` で削除していましたが、現在は `five_hour` が `0%` / `null` の場合は `claude -p "ping"` で新セッションを自動開始して新しい `resets_at` を取得し、`PATCH` で移動/作成します（削除はしません）。`weekly` が `null` の場合のみ削除されます。以前 5-hour が `0%` で削除されていたケースでも、今後は `ping` 後に新時刻へ移動されます。
 
 **注意:** OAuth同意画面が `テスト` モードの場合、`refresh_token` は7日で失効します（`refresh_token_expires_in: 604799`）。`本番環境` に公開するか、7日ごとに `bun run calendar:auth` で再認証してください。`access_token` は1時間で失効しますが、`--calendar-auth` 時に `client_id` / `client_secret` も一緒に `~/.config/ccusage-notifier/google-calendar-token.json` に保存されるため、以降は `GOOGLE_CLIENT_ID/SECRET` 環境変数なしでも自動リフレッシュされます。`--calendar` の `resets_at` は取得時点のスナップショットなので、時間経過で変わる場合は再実行してください。
 
@@ -257,6 +257,7 @@ console.log(generateIcs(events)); // ICS 文字列
 - `security` コマンドは macOS 専用です。Linux では環境変数でトークンを渡してください。
 - Keychain アクセスで `Could not read Claude Code credentials` が出る場合は、Claude Code にログイン済みか確認してください。
 - Google Calendar のリセット時刻は取得時点の `resets_at` のスナップショットです。時間経過で変わるため、定期的に `bun run index.ts --calendar --calendar-api` を再実行してください。既存予定は自動で新時刻へ移動（`PATCH`）され、重複は削除されます。`--watch` と組み合わせると毎回チェックされ、時刻変更時のみ移動します。
+- 5-hour が `0%` かつ `resets_at: null` の場合（セッション未開始）は、`--calendar` / `--calendar-api` 実行時に `claude -p "ping" --output-format json` で自動的に新セッションを開始し、新しい `resets_at` でカレンダー予定を移動/作成します。`claude` コマンドが未インストールの場合は警告のみでスキップされ、従来通り予定は作成されません。1回の `ping` は数セント（例: $0.07）かかります。
 
 ## 開発
 

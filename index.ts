@@ -768,17 +768,93 @@ Alternatively, use OAuth Playground (no GCP needed, 2 min):
   return stored;
 }
 
-export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions): Promise<void> {
-  const events = buildCalendarEvents(usage);
+export async function triggerClaudePing(pingMessage = "ping"): Promise<{ success: boolean; output?: string; error?: string }> {
+  console.log(`[calendar] 5-hour reset is null (0%), triggering claude -p ping to start new session...`);
+  try {
+    const proc = Bun.spawn(["claude", "-p", pingMessage, "--output-format", "json"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const exit = await proc.exited;
+    if (exit !== 0) {
+      console.warn(`[calendar] claude ping failed (exit ${exit}): ${err.slice(0, 500)}`);
+      return { success: false, error: err };
+    }
+    // Try to parse output for cost, but not required
+    try {
+      const parsed = JSON.parse(out);
+      if (parsed?.total_cost_usd) console.log(`[calendar] claude ping succeeded, cost $${parsed.total_cost_usd}`);
+    } catch {}
+    return { success: true, output: out };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn(`[calendar] claude ping spawn failed: ${msg}`);
+    return { success: false, error: msg };
+  }
+}
 
-  // Determine which kinds are missing (reset is null) - need to delete old events for those
+export async function ensureFiveHourReset(
+  usage: ClaudeUsage,
+  claudeToken: string,
+  maxRetries = 5,
+): Promise<ClaudeUsage> {
+  if (usage.five_hour?.resets_at) return usage;
+  // Only ping when 5h is 0% or null and no reset
+  const isZero = (usage.five_hour?.utilization ?? 0) === 0;
+  if (!isZero) return usage;
+  const ping = await triggerClaudePing("ping");
+  if (!ping.success) {
+    console.warn("[calendar] Skipping 5h reset refresh due to ping failure");
+    return usage;
+  }
+  // Poll for new reset (API may take a few seconds to update)
+  for (let i = 0; i < maxRetries; i++) {
+    await Bun.sleep(2000);
+    try {
+      const refreshed = await getClaudeUsage(claudeToken);
+      if (refreshed.five_hour?.resets_at) {
+        console.log(`[calendar] New 5-hour reset obtained: ${refreshed.five_hour.resets_at} (after ${i + 1} poll(s))`);
+        // Merge weekly from refreshed (keep latest)
+        return refreshed;
+      }
+      console.log(`[calendar] Poll ${i + 1}/${maxRetries}: 5h reset still null, retrying...`);
+    } catch (e) {
+      console.warn(`[calendar] Poll ${i + 1} failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  console.warn("[calendar] 5h reset still null after poll, proceeding with original usage");
+  return usage;
+}
+
+export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions): Promise<void> {
+  // If 5h reset is null (0%), try to start a new session via claude ping so we can move the calendar event instead of deleting
+  let effectiveUsage = usage;
+  if (!usage.five_hour?.resets_at && opts.calendar) {
+    const isZero = (usage.five_hour?.utilization ?? 0) === 0;
+    if (isZero) {
+      try {
+        const claudeToken = opts.token ?? (await getClaudeToken());
+        effectiveUsage = await ensureFiveHourReset(usage, claudeToken);
+      } catch (e) {
+        console.warn(`[calendar] ensureFiveHourReset failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+
+  const events = buildCalendarEvents(effectiveUsage);
+
+  // Determine which kinds are missing (reset is null) - need to delete old events for those (only weekly now; 5h is handled via ping)
   const missingKinds: Array<"five_hour" | "weekly"> = [];
-  if (!usage.five_hour?.resets_at) missingKinds.push("five_hour");
-  if (!usage.seven_day?.resets_at) missingKinds.push("weekly");
+  // 5h: if still null after ping attempt, don't delete - will be handled as no event (user said deletion not needed, always move)
+  // So only weekly null leads to deletion
+  if (!effectiveUsage.seven_day?.resets_at) missingKinds.push("weekly");
+  // For 5h, if still null after ping, we skip deletion and just don't create event (no move)
+  const hasFiveHourNullAfterPing = !effectiveUsage.five_hour?.resets_at;
 
   if (events.length === 0) {
     console.log("[calendar] No reset times available in usage data (both resets_at are null)");
-    // Still handle deletions for both kinds if needed
     if (missingKinds.length > 0 && opts.calendarApi) {
       const clientId = process.env.GOOGLE_CLIENT_ID ?? process.env.GOOGLE_OAUTH_CLIENT_ID;
       const clientSecret = process.env.GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_OAUTH_CLIENT_SECRET;
@@ -982,6 +1058,7 @@ Options:
   --calendar-out <path>           ICS output path (default: ccusage-reset.ics)
   --calendar-open                 Also open Google Calendar template URL in browser
   --calendar-api                  Insert events via Google Calendar API (needs GOOGLE_OAUTH_TOKEN or stored token)
+                                  When 5h is 0% with no reset, auto-runs 'claude -p ping' to start new session and moves calendar event
   --calendar-id <id>              Target calendar ID for --calendar-api (default: primary)
   --calendar-auth                 Start OAuth flow to obtain Google Calendar token (needs GOOGLE_CLIENT_ID/SECRET)
   --calendar-auth-port <port>     Port for OAuth callback server (default: 8085)
