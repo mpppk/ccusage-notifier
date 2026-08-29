@@ -10,10 +10,8 @@
     "start": "bun run index.ts",
     "dev": "bun --watch run index.ts",
     "check": "bun run index.ts --json",
-    "notify": "bun run index.ts --notify --threshold 80",
-    "watch": "bun run index.ts --watch 300 --notify",
+    "watch": "bun run index.ts --watch 300 --calendar --calendar-api",
     "calendar": "bun run index.ts --calendar",
-    "calendar:open": "bun run index.ts --calendar --calendar-open",
     "calendar:api": "bun run index.ts --calendar --calendar-api",
     "calendar:auth": "bun run index.ts --calendar-auth"
   },

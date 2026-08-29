@@ -1,10 +1,9 @@
 #!/usr/bin/env bun
 
 /**
- * ccusage-notifier - Claude Code usage fetcher & notifier
+ * ccusage-notifier - Claude Code usage fetcher & Google Calendar sync
  *
  * Fetches usage via Anthropic OAuth API using the token stored in macOS Keychain.
- * The token is stored by Claude Code as "Claude Code-credentials" generic password.
  */
 
 type UsageBucket = {
@@ -40,19 +39,15 @@ type ClaudeUsage = {
 };
 
 export type NotifierOptions = {
-  thresholdFiveHour?: number; // 0-100
-  thresholdSevenDay?: number;
   json?: boolean;
-  notify?: boolean;
   watchIntervalSec?: number;
   token?: string;
   calendar?: boolean;
-  calendarOut?: string;
-  calendarOpen?: boolean;
   calendarApi?: boolean;
   calendarId?: string;
   calendarAuth?: boolean;
   calendarAuthPort?: number;
+  calendarOpen?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -60,14 +55,12 @@ export type NotifierOptions = {
 // ---------------------------------------------------------------------------
 
 export async function getClaudeToken(): Promise<string> {
-  // 1. env var override (useful for CI / Linux)
   const envToken =
     process.env.CLAUDE_CODE_OAUTH_TOKEN ??
     process.env.ANTHROPIC_OAUTH_TOKEN ??
     process.env.CLAUDE_TOKEN;
   if (envToken) return envToken.trim();
 
-  // 2. macOS Keychain via `security`
   const user = process.env.USER;
   if (!user) throw new Error("USER env var is not set; cannot read keychain");
 
@@ -91,11 +84,9 @@ export async function getClaudeToken(): Promise<string> {
     const parsed = JSON.parse(trimmed);
     const token = parsed?.claudeAiOauth?.accessToken;
     if (typeof token === "string" && token.length > 0) return token;
-    // Fallback: maybe raw is already a token string
     if (typeof parsed === "string" && parsed.startsWith("sk-ant-")) return parsed;
     throw new Error("claudeAiOauth.accessToken not found in keychain JSON");
   } catch (e) {
-    // If JSON parse failed, maybe raw itself is the token
     if (trimmed.startsWith("sk-ant-")) return trimmed;
     throw e;
   }
@@ -127,12 +118,10 @@ function formatResetsAt(iso: string | null | undefined): string {
   if (!iso) return "-";
   const d = new Date(iso);
   if (isNaN(d.getTime())) return iso;
-  // Show both UTC and JST for convenience
   const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
   const pad = (n: number) => String(n).padStart(2, "0");
   const fmt = (date: Date) =>
     `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
-  // UTC string + JST in parentheses, plus relative
   const now = Date.now();
   const diffMs = d.getTime() - now;
   const relative = formatDuration(diffMs);
@@ -190,29 +179,6 @@ export function formatUsage(usage: ClaudeUsage): string {
   return lines.join("\n");
 }
 
-export function shouldNotify(
-  usage: ClaudeUsage,
-  thresholdFiveHour = 80,
-  thresholdSevenDay = 80,
-): { notify: boolean; reasons: string[] } {
-  const reasons: string[] = [];
-  const five = usage.five_hour?.utilization;
-  const seven = usage.seven_day?.utilization;
-  if (typeof five === "number" && five >= thresholdFiveHour) {
-    reasons.push(`5-hour ${five}% >= ${thresholdFiveHour}%`);
-  }
-  if (typeof seven === "number" && seven >= thresholdSevenDay) {
-    reasons.push(`7-day ${seven}% >= ${thresholdSevenDay}%`);
-  }
-  // Also notify if any limit is critical/active
-  for (const lim of usage.limits ?? []) {
-    if (lim.is_active && lim.severity === "critical") {
-      reasons.push(`limit ${lim.kind} is critical (${lim.percent}%)`);
-    }
-  }
-  return { notify: reasons.length > 0, reasons };
-}
-
 // ---------------------------------------------------------------------------
 // Google Calendar integration
 // ---------------------------------------------------------------------------
@@ -220,9 +186,8 @@ export function shouldNotify(
 export type CalendarEventInput = {
   summary: string;
   description: string;
-  startIso: string; // ISO 8601
+  startIso: string;
   durationMinutes?: number;
-  // Used to identify/match existing events for upsert (patch instead of create)
   kind?: "five_hour" | "weekly";
 };
 
@@ -233,10 +198,6 @@ function toGoogleCalendarDate(iso: string): string {
     `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}` +
     `T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`
   );
-}
-
-function toIcsDate(iso: string): string {
-  return toGoogleCalendarDate(iso);
 }
 
 export function buildGoogleCalendarUrl(event: CalendarEventInput): string {
@@ -279,41 +240,6 @@ export function buildCalendarEvents(usage: ClaudeUsage): CalendarEventInput[] {
   return events;
 }
 
-export function generateIcs(events: CalendarEventInput[]): string {
-  const nowIcs = toIcsDate(new Date().toISOString());
-  const uidSuffix = "@ccusage-notifier";
-  const escapeIcs = (s: string) => s.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/,/g, "\\,").replace(/;/g, "\\;");
-
-  const lines: string[] = [];
-  lines.push("BEGIN:VCALENDAR");
-  lines.push("VERSION:2.0");
-  lines.push("PRODID:-//ccusage-notifier//EN");
-  lines.push("CALSCALE:GREGORIAN");
-  lines.push("METHOD:PUBLISH");
-  for (const ev of events) {
-    const start = toIcsDate(ev.startIso);
-    const end = toIcsDate(new Date(new Date(ev.startIso).getTime() + (ev.durationMinutes ?? 15) * 60 * 1000).toISOString());
-    const uid = `${start}-${escapeIcs(ev.summary).replace(/\s+/g, "-")}${uidSuffix}`;
-    lines.push("BEGIN:VEVENT");
-    lines.push(`UID:${uid}`);
-    lines.push(`DTSTAMP:${nowIcs}`);
-    lines.push(`DTSTART:${start}`);
-    lines.push(`DTEND:${end}`);
-    lines.push(`SUMMARY:${escapeIcs(ev.summary)}`);
-    lines.push(`DESCRIPTION:${escapeIcs(ev.description)}`);
-    lines.push("STATUS:CONFIRMED");
-    lines.push("TRANSP:TRANSPARENT");
-    lines.push("END:VEVENT");
-  }
-  lines.push("END:VCALENDAR");
-  return lines.join("\r\n") + "\r\n";
-}
-
-export async function writeIcsFile(path: string, events: CalendarEventInput[]): Promise<void> {
-  const ics = generateIcs(events);
-  await Bun.write(path, ics);
-}
-
 export async function insertGoogleCalendarEvent(
   accessToken: string,
   calendarId: string,
@@ -327,7 +253,6 @@ export async function insertGoogleCalendarEvent(
     start: { dateTime: start.toISOString() },
     end: { dateTime: end.toISOString() },
     reminders: { useDefault: true },
-    // Mark events for future upsert matching via private extended properties
     extendedProperties: {
       private: {
         source: "ccusage-notifier",
@@ -409,7 +334,6 @@ export async function listGoogleCalendarEvents(
   params.set("singleEvents", "true");
   params.set("orderBy", "startTime");
   params.set("maxResults", String(opts.maxResults ?? 50));
-  // Prefer filtering by our marker when possible; fallback to q search if not indexed yet
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${params.toString()}`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
   if (!res.ok) throw new Error(`Google Calendar LIST failed: ${res.status} ${await res.text()}`);
@@ -423,7 +347,6 @@ export async function upsertGoogleCalendarEvent(
   event: CalendarEventInput,
 ): Promise<{ action: "created" | "updated" | "moved"; id: string; htmlLink?: string }> {
   const kind = event.kind ?? (event.summary.includes("weekly") ? "weekly" : "five_hour");
-  // Search window: from 1 day ago to 30 days ahead to find existing instances
   const timeMin = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const timeMax = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
   const items = await listGoogleCalendarEvents(accessToken, calendarId, {
@@ -433,19 +356,16 @@ export async function upsertGoogleCalendarEvent(
     maxResults: 50,
   });
 
-  // Filter to our events by summary + (extendedProperties marker if present or legacy fallback by summary)
   const candidates = items.filter((it) => {
     if (!it.summary) return false;
     const isSameKind =
       (kind === "five_hour" && it.summary.includes("5-hour")) || (kind === "weekly" && it.summary.includes("weekly"));
     if (!isSameKind) return false;
-    // If event has marker, check it; otherwise fallback to summary match (covers legacy events before marker)
     const marker = it.extendedProperties?.private?.source;
     if (marker) return marker === "ccusage-notifier";
-    return true; // legacy fallback
+    return true;
   });
 
-  // Sort by start time
   candidates.sort((a, b) => {
     const ta = a.start?.dateTime ? new Date(a.start.dateTime).getTime() : 0;
     const tb = b.start?.dateTime ? new Date(b.start.dateTime).getTime() : 0;
@@ -460,7 +380,6 @@ export async function upsertGoogleCalendarEvent(
     return { action: "created", id: created.id, htmlLink: created.htmlLink };
   }
 
-  // Pick the first candidate as primary; if its time already matches (second precision), treat as updated, else move
   const primary = candidates[0]!;
   const primarySec = primary.start?.dateTime ? toSec(primary.start.dateTime) : null;
   const isSameTime = primarySec === wantedSec;
@@ -470,7 +389,6 @@ export async function upsertGoogleCalendarEvent(
     htmlLink?: string;
   };
 
-  // Clean up duplicates beyond primary
   if (candidates.length > 1) {
     for (let i = 1; i < candidates.length; i++) {
       try {
@@ -494,7 +412,7 @@ function getGoogleTokenFilePath(): string {
 type StoredGoogleToken = {
   access_token: string;
   refresh_token?: string;
-  expires_at?: number; // epoch ms
+  expires_at?: number;
   scope?: string;
   token_type?: string;
   obtained_at?: string;
@@ -523,11 +441,9 @@ async function readStoredGoogleToken(): Promise<StoredGoogleToken | null> {
 async function writeStoredGoogleToken(token: StoredGoogleToken): Promise<string> {
   const path = getGoogleTokenFilePath();
   const dir = path.substring(0, path.lastIndexOf("/"));
-  // ensure dir exists
   const proc = Bun.spawn(["mkdir", "-p", dir], { stdout: "pipe", stderr: "pipe" });
   await proc.exited;
   await Bun.write(path, JSON.stringify(token, null, 2));
-  // chmod 600
   const chmod = Bun.spawn(["chmod", "600", path], { stdout: "pipe", stderr: "pipe" });
   await chmod.exited;
   return path;
@@ -557,7 +473,6 @@ async function refreshGoogleAccessToken(refreshToken: string, clientId: string, 
 }
 
 export async function getGoogleAccessToken(clientId?: string, clientSecret?: string): Promise<string | null> {
-  // Resolve client credentials first (for refresh flows) - try env, then stored file
   const storedForCreds = await readStoredGoogleToken();
   const resolvedClientId =
     clientId ??
@@ -570,7 +485,6 @@ export async function getGoogleAccessToken(clientId?: string, clientSecret?: str
     process.env.GOOGLE_OAUTH_CLIENT_SECRET ??
     storedForCreds?.client_secret;
 
-  // 0. If refresh_token is provided via env, try to obtain fresh access_token immediately (preferred for persistence)
   const envRefreshToken = process.env.GOOGLE_REFRESH_TOKEN;
   if (envRefreshToken && resolvedClientId && resolvedClientSecret) {
     try {
@@ -586,16 +500,6 @@ export async function getGoogleAccessToken(clientId?: string, clientSecret?: str
     }
   }
 
-  // 1. env var access token (highest priority for one-off, e.g. Playground)
-  const envToken = process.env.GOOGLE_OAUTH_TOKEN ?? process.env.GOOGLE_CALENDAR_TOKEN ?? process.env.GOOGLE_ACCESS_TOKEN;
-  if (envToken) {
-    if (!envRefreshToken) {
-      console.log("[calendar] Using GOOGLE_OAUTH_TOKEN from env (expires in ~1h, no refresh). For persistence, set GOOGLE_REFRESH_TOKEN or use --calendar-auth");
-    }
-    return envToken.trim();
-  }
-
-  // 2. stored file
   const stored = storedForCreds ?? (await readStoredGoogleToken());
   if (!stored) return null;
 
@@ -645,14 +549,6 @@ export async function runGoogleCalendarAuth(opts: { port?: number; clientId?: st
 5. Copy Client ID and Client Secret, then run:
 
   GOOGLE_CLIENT_ID="xxx.apps.googleusercontent.com" GOOGLE_CLIENT_SECRET="GOCSPX-xxx" bun run index.ts --calendar-auth
-  # or
-  bun run index.ts --calendar-auth --calendar-id primary
-
-Alternatively, use OAuth Playground (no GCP needed, 2 min):
-  1. Go to https://developers.google.com/oauthplayground
-  2. Select scope: https://www.googleapis.com/auth/calendar.events > Authorize APIs
-  3. Exchange code for tokens > copy Access token
-  4. GOOGLE_OAUTH_TOKEN="ya29..." bun run index.ts --calendar --calendar-api
 
 `);
     throw new Error("Missing GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET");
@@ -704,13 +600,11 @@ Alternatively, use OAuth Playground (no GCP needed, 2 min):
     },
   });
 
-  // open browser
   const openProc = Bun.spawn(["open", authUrl.toString()], { stdout: "pipe", stderr: "pipe" });
   await openProc.exited;
 
   console.log("[calendar-auth] Waiting for OAuth callback... (Ctrl+C to cancel)");
 
-  // timeout 5 minutes
   const timeout = setTimeout(() => rejectCode(new Error("OAuth callback timeout (5 min). Try again.")), 5 * 60 * 1000);
 
   let code: string;
@@ -782,7 +676,6 @@ export async function triggerClaudePing(pingMessage = "ping"): Promise<{ success
       console.warn(`[calendar] claude ping failed (exit ${exit}): ${err.slice(0, 500)}`);
       return { success: false, error: err };
     }
-    // Try to parse output for cost, but not required
     try {
       const parsed = JSON.parse(out);
       if (parsed?.total_cost_usd) console.log(`[calendar] claude ping succeeded, cost $${parsed.total_cost_usd}`);
@@ -801,7 +694,6 @@ export async function ensureFiveHourReset(
   maxRetries = 5,
 ): Promise<ClaudeUsage> {
   if (usage.five_hour?.resets_at) return usage;
-  // Only ping when 5h is 0% or null and no reset
   const isZero = (usage.five_hour?.utilization ?? 0) === 0;
   if (!isZero) return usage;
   const ping = await triggerClaudePing("ping");
@@ -809,14 +701,12 @@ export async function ensureFiveHourReset(
     console.warn("[calendar] Skipping 5h reset refresh due to ping failure");
     return usage;
   }
-  // Poll for new reset (API may take a few seconds to update)
   for (let i = 0; i < maxRetries; i++) {
     await Bun.sleep(2000);
     try {
       const refreshed = await getClaudeUsage(claudeToken);
       if (refreshed.five_hour?.resets_at) {
         console.log(`[calendar] New 5-hour reset obtained: ${refreshed.five_hour.resets_at} (after ${i + 1} poll(s))`);
-        // Merge weekly from refreshed (keep latest)
         return refreshed;
       }
       console.log(`[calendar] Poll ${i + 1}/${maxRetries}: 5h reset still null, retrying...`);
@@ -829,7 +719,6 @@ export async function ensureFiveHourReset(
 }
 
 export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions): Promise<void> {
-  // If 5h reset is null (0%), try to start a new session via claude ping so we can move the calendar event instead of deleting
   let effectiveUsage = usage;
   if (!usage.five_hour?.resets_at && opts.calendar) {
     const isZero = (usage.five_hour?.utilization ?? 0) === 0;
@@ -844,14 +733,8 @@ export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions):
   }
 
   const events = buildCalendarEvents(effectiveUsage);
-
-  // Determine which kinds are missing (reset is null) - need to delete old events for those (only weekly now; 5h is handled via ping)
   const missingKinds: Array<"five_hour" | "weekly"> = [];
-  // 5h: if still null after ping attempt, don't delete - will be handled as no event (user said deletion not needed, always move)
-  // So only weekly null leads to deletion
   if (!effectiveUsage.seven_day?.resets_at) missingKinds.push("weekly");
-  // For 5h, if still null after ping, we skip deletion and just don't create event (no move)
-  const hasFiveHourNullAfterPing = !effectiveUsage.five_hour?.resets_at;
 
   if (events.length === 0) {
     console.log("[calendar] No reset times available in usage data (both resets_at are null)");
@@ -885,13 +768,6 @@ export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions):
     }
   }
 
-  // ICS file
-  const outPath = opts.calendarOut ?? "ccusage-reset.ics";
-  await writeIcsFile(outPath, events);
-  console.log(`\n[calendar] ICS file written: ${outPath} (${events.length} events)`);
-  console.log(`  Import via: Google Calendar > Settings > Import & export > Import > select ${outPath}`);
-  console.log(`  Or drag & drop ${outPath} into Google Calendar web UI`);
-
   if (opts.calendarOpen) {
     for (const ev of events) {
       const url = buildGoogleCalendarUrl(ev);
@@ -907,16 +783,13 @@ export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions):
     const token = await getGoogleAccessToken(clientId, clientSecret);
     if (!token) {
       console.error(
-        "[calendar] --calendar-api requires auth. Either:\n" +
-          "  1) Set GOOGLE_OAUTH_TOKEN env var, or\n" +
-          "  2) Run: bun run index.ts --calendar-auth (then --calendar --calendar-api)\n" +
+        "[calendar] --calendar-api requires auth. Run: bun run index.ts --calendar-auth (then --calendar --calendar-api)\n" +
           "  See README for OAuth setup. Scope required: https://www.googleapis.com/auth/calendar.events",
       );
       return;
     }
     const calendarId = opts.calendarId ?? process.env.GOOGLE_CALENDAR_ID ?? "primary";
 
-    // First, delete stale events for missing kinds
     for (const kind of missingKinds) {
       try {
         const count = await deleteCalendarEventsByKind(token, calendarId, kind);
@@ -969,23 +842,6 @@ export async function deleteCalendarEventsByKind(
 }
 
 // ---------------------------------------------------------------------------
-// macOS notification
-// ---------------------------------------------------------------------------
-
-export async function sendMacNotification(title: string, body: string, subtitle?: string): Promise<void> {
-  const escape = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
-  const script = subtitle
-    ? `display notification "${escape(body)}" with title "${escape(title)}" subtitle "${escape(subtitle)}"`
-    : `display notification "${escape(body)}" with title "${escape(title)}"`;
-  const proc = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
-  const exit = await proc.exited;
-  if (exit !== 0) {
-    const err = await new Response(proc.stderr).text();
-    console.warn(`[ccusage-notifier] osascript notification failed: ${err.trim()}`);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -995,44 +851,28 @@ function parseArgs(argv: string[]): NotifierOptions & { help?: boolean; once?: b
     const a = argv[i]!;
     if (a === "--help" || a === "-h") opts.help = true;
     else if (a === "--json") opts.json = true;
-    else if (a === "--notify") opts.notify = true;
     else if (a === "--once") opts.once = true;
     else if (a === "--calendar") opts.calendar = true;
     else if (a === "--calendar-open") opts.calendarOpen = true;
     else if (a === "--calendar-api") opts.calendarApi = true;
     else if (a === "--calendar-auth") opts.calendarAuth = true;
-    else if (a === "--calendar-out") opts.calendarOut = argv[++i];
     else if (a === "--calendar-id") opts.calendarId = argv[++i];
-    else if (a.startsWith("--calendar-out=")) opts.calendarOut = a.split("=").slice(1).join("=");
     else if (a.startsWith("--calendar-id=")) opts.calendarId = a.split("=").slice(1).join("=");
     else if (a.startsWith("--calendar-auth-port=")) opts.calendarAuthPort = Number(a.split("=").slice(1).join("="));
     else if (a === "--calendar-auth-port") opts.calendarAuthPort = Number(argv[++i]);
-    else if (a === "--threshold-five" || a === "--threshold-five-hour") {
-      opts.thresholdFiveHour = Number(argv[++i]);
-    } else if (a === "--threshold-week" || a === "--threshold-seven" || a === "--threshold-seven-day") {
-      opts.thresholdSevenDay = Number(argv[++i]);
-    } else if (a === "--threshold" || a === "-t") {
-      const v = Number(argv[++i]);
-      opts.thresholdFiveHour = v;
-      opts.thresholdSevenDay = v;
-    } else if (a === "--watch" || a === "-w") {
+    else if (a === "--watch" || a === "-w") {
       const next = argv[i + 1];
       if (next && !next.startsWith("-") && !isNaN(Number(next))) {
         opts.watchIntervalSec = Number(argv[++i]);
       } else {
-        opts.watchIntervalSec = 300; // default 5min
+        opts.watchIntervalSec = 300;
       }
     } else if (a === "--interval") {
       opts.watchIntervalSec = Number(argv[++i]);
-    } else if (a.startsWith("--threshold-five=")) {
-      opts.thresholdFiveHour = Number(a.split("=")[1]);
-    } else if (a.startsWith("--threshold-week=") || a.startsWith("--threshold-seven=")) {
-      opts.thresholdSevenDay = Number(a.split("=")[1]);
     } else if (a.startsWith("--watch=")) {
       opts.watchIntervalSec = Number(a.split("=")[1]);
     }
   }
-  // --calendar-open / --calendar-api implies --calendar
   if (opts.calendarOpen) opts.calendar = true;
   if (opts.calendarApi) opts.calendar = true;
   return opts;
@@ -1040,25 +880,19 @@ function parseArgs(argv: string[]): NotifierOptions & { help?: boolean; once?: b
 
 function printHelp() {
   console.log(`
-ccusage-notifier - Claude Code usage fetcher & notifier
+ccusage-notifier - Claude Code usage fetcher & Google Calendar sync
 
 Usage:
   bun run index.ts [options]
-  bun index.ts [options]
 
 Options:
   --json                          Output raw JSON instead of pretty table
-  --notify                        Send macOS notification when threshold exceeded
-  --threshold <n>                 Set both 5h and 7-day thresholds (default 80)
-  --threshold-five <n>            5-hour threshold percent (default 80)
-  --threshold-week <n>            7-day threshold percent (default 80)
   --watch [sec]                   Poll every <sec> seconds (default 300) until Ctrl+C
   --interval <sec>                Alias for --watch
-  --calendar                      Generate Google Calendar events for reset times (ICS + URL)
-  --calendar-out <path>           ICS output path (default: ccusage-reset.ics)
+  --calendar                      Generate Google Calendar events for reset times
   --calendar-open                 Also open Google Calendar template URL in browser
-  --calendar-api                  Insert events via Google Calendar API (needs GOOGLE_OAUTH_TOKEN or stored token)
-                                  When 5h is 0% with no reset, auto-runs 'claude -p ping' to start new session and moves calendar event
+  --calendar-api                  Sync events via Google Calendar API (refresh_token only)
+                                  When 5h is 0% with no reset, auto-runs 'claude -p ping' to start new session
   --calendar-id <id>              Target calendar ID for --calendar-api (default: primary)
   --calendar-auth                 Start OAuth flow to obtain Google Calendar token (needs GOOGLE_CLIENT_ID/SECRET)
   --calendar-auth-port <port>     Port for OAuth callback server (default: 8085)
@@ -1067,23 +901,19 @@ Options:
 
 Env:
   CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_OAUTH_TOKEN / CLAUDE_TOKEN  Override keychain token
-  GOOGLE_OAUTH_TOKEN / GOOGLE_CALENDAR_TOKEN  OAuth2 token for --calendar-api (scope: calendar.events)
+  GOOGLE_REFRESH_TOKEN            Refresh token for --calendar-api (with GOOGLE_CLIENT_ID/SECRET)
   GOOGLE_CALENDAR_ID              Default calendar ID (default: primary)
   GOOGLE_CLIENT_ID / GOOGLE_OAUTH_CLIENT_ID
-  GOOGLE_CLIENT_SECRET / GOOGLE_OAUTH_CLIENT_SECRET  For --calendar-auth
-  GOOGLE_CLIENT_ID/SECRET also used for token refresh when stored token expires
+  GOOGLE_CLIENT_SECRET / GOOGLE_OAUTH_CLIENT_SECRET  For --calendar-auth and token refresh
 
 Examples:
   bun run index.ts
   bun run index.ts --json
-  bun run index.ts --notify --threshold 90
-  bun run index.ts --watch 60 --notify
-  bun run index.ts --watch --threshold-five 70 --threshold-week 80
+  bun run index.ts --watch 300 --calendar --calendar-api
   bun run index.ts --calendar
   bun run index.ts --calendar --calendar-open
   bun run index.ts --calendar --calendar-api --calendar-id primary
-  GOOGLE_OAUTH_TOKEN=\$(gcloud auth print-access-token) bun run index.ts --calendar --calendar-api
-  # First time OAuth:
+  # First time OAuth (refresh_token):
   GOOGLE_CLIENT_ID=xxx.apps.googleusercontent.com GOOGLE_CLIENT_SECRET=GOCSPX-xxx bun run index.ts --calendar-auth
   bun run index.ts --calendar --calendar-api
 `);
@@ -1097,7 +927,6 @@ async function runOnce(opts: NotifierOptions): Promise<ClaudeUsage> {
     console.log(JSON.stringify(usage, null, 2));
   } else {
     console.log(formatUsage(usage));
-    // also show compact json-friendly line for piping
     console.log("");
     console.log(
       JSON.stringify({
@@ -1107,21 +936,6 @@ async function runOnce(opts: NotifierOptions): Promise<ClaudeUsage> {
         weekReset: usage.seven_day?.resets_at,
       }),
     );
-  }
-
-  if (opts.notify) {
-    const thFive = opts.thresholdFiveHour ?? 80;
-    const thWeek = opts.thresholdSevenDay ?? 80;
-    const { notify, reasons } = shouldNotify(usage, thFive, thWeek);
-    if (notify) {
-      const title = "Claude Code usage alert";
-      const body = reasons.join(", ");
-      const subtitle = `5h ${usage.five_hour?.utilization ?? "-"}% / 7d ${usage.seven_day?.utilization ?? "-"}%`;
-      console.log(`\n[notify] ${title}: ${body} (${subtitle})`);
-      await sendMacNotification(title, body, subtitle);
-    } else {
-      if (!opts.json) console.log(`\n[notify] thresholds not exceeded (5h < ${thFive}%, 7d < ${thWeek}%) - no notification sent`);
-    }
   }
 
   if (opts.calendar) {
@@ -1135,7 +949,6 @@ async function runOnce(opts: NotifierOptions): Promise<ClaudeUsage> {
 const isMain = import.meta.main ?? import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
   const argv = process.argv.slice(2);
-  // also support `bun index.ts` where argv may include `index.ts` handling is already done by Bun
   const opts = parseArgs(argv);
 
   if (opts.help) {
@@ -1153,13 +966,8 @@ if (isMain) {
     }
   }
 
-  // defaults
-  opts.thresholdFiveHour ??= 80;
-  opts.thresholdSevenDay ??= 80;
-
   if (opts.watchIntervalSec && opts.watchIntervalSec > 0) {
-    console.log(`[ccusage-notifier] watching every ${opts.watchIntervalSec}s (Ctrl+C to stop) -- thresholds 5h=${opts.thresholdFiveHour}% 7d=${opts.thresholdSevenDay}% ${opts.notify ? "with notify" : ""}`);
-    // run immediately
+    console.log(`[ccusage-notifier] watching every ${opts.watchIntervalSec}s (Ctrl+C to stop)`);
     await runOnce(opts).catch((e) => {
       console.error(`[error] ${e instanceof Error ? e.message : String(e)}`);
     });
@@ -1171,7 +979,6 @@ if (isMain) {
         console.error(`[error] ${e instanceof Error ? e.message : String(e)}`);
       }
     }, opts.watchIntervalSec * 1000);
-    // graceful shutdown
     process.on("SIGINT", () => {
       clearInterval(interval);
       console.log("\n[ccusage-notifier] stopped");
