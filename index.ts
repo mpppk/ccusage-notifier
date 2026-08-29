@@ -498,6 +498,8 @@ type StoredGoogleToken = {
   scope?: string;
   token_type?: string;
   obtained_at?: string;
+  client_id?: string;
+  client_secret?: string;
 };
 
 async function readStoredGoogleToken(): Promise<StoredGoogleToken | null> {
@@ -555,31 +557,38 @@ async function refreshGoogleAccessToken(refreshToken: string, clientId: string, 
 }
 
 export async function getGoogleAccessToken(clientId?: string, clientSecret?: string): Promise<string | null> {
-  // Resolve client credentials first (for refresh flows)
-  const resolvedClientId = clientId ?? process.env.GOOGLE_CLIENT_ID ?? process.env.GOOGLE_OAUTH_CLIENT_ID;
-  const resolvedClientSecret = clientSecret ?? process.env.GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  // Resolve client credentials first (for refresh flows) - try env, then stored file
+  const storedForCreds = await readStoredGoogleToken();
+  const resolvedClientId =
+    clientId ??
+    process.env.GOOGLE_CLIENT_ID ??
+    process.env.GOOGLE_OAUTH_CLIENT_ID ??
+    storedForCreds?.client_id;
+  const resolvedClientSecret =
+    clientSecret ??
+    process.env.GOOGLE_CLIENT_SECRET ??
+    process.env.GOOGLE_OAUTH_CLIENT_SECRET ??
+    storedForCreds?.client_secret;
 
   // 0. If refresh_token is provided via env, try to obtain fresh access_token immediately (preferred for persistence)
   const envRefreshToken = process.env.GOOGLE_REFRESH_TOKEN;
   if (envRefreshToken && resolvedClientId && resolvedClientSecret) {
-    // Also support storing the env refresh_token for future use if no file exists
     try {
       const refreshed = await refreshGoogleAccessToken(envRefreshToken, resolvedClientId, resolvedClientSecret);
       refreshed.refresh_token = envRefreshToken;
+      refreshed.client_id = resolvedClientId;
+      refreshed.client_secret = resolvedClientSecret;
       const path = await writeStoredGoogleToken(refreshed);
       console.log(`[calendar] Refreshed access token from GOOGLE_REFRESH_TOKEN, saved to ${path}`);
       return refreshed.access_token;
     } catch (e) {
       console.warn(`[calendar] Refresh from GOOGLE_REFRESH_TOKEN failed: ${e instanceof Error ? e.message : String(e)}`);
-      // fall through to other methods
     }
   }
 
   // 1. env var access token (highest priority for one-off, e.g. Playground)
   const envToken = process.env.GOOGLE_OAUTH_TOKEN ?? process.env.GOOGLE_CALENDAR_TOKEN ?? process.env.GOOGLE_ACCESS_TOKEN;
   if (envToken) {
-    // Also persist playground/access token if refresh is not available, for at least short-term reuse
-    // but warn about expiry
     if (!envRefreshToken) {
       console.log("[calendar] Using GOOGLE_OAUTH_TOKEN from env (expires in ~1h, no refresh). For persistence, set GOOGLE_REFRESH_TOKEN or use --calendar-auth");
     }
@@ -587,33 +596,35 @@ export async function getGoogleAccessToken(clientId?: string, clientSecret?: str
   }
 
   // 2. stored file
-  const stored = await readStoredGoogleToken();
+  const stored = storedForCreds ?? (await readStoredGoogleToken());
   if (!stored) return null;
 
-  // if expires_at is in future, return as is
   if (stored.expires_at && stored.expires_at > Date.now() + 30_000) {
     return stored.access_token;
   }
 
-  // if has refresh_token and client credentials, try refresh
   if (stored.refresh_token && resolvedClientId && resolvedClientSecret) {
     try {
       console.log("[calendar] Access token expired, refreshing via stored refresh_token...");
       const refreshed = await refreshGoogleAccessToken(stored.refresh_token, resolvedClientId, resolvedClientSecret);
-      // keep refresh_token (Google may not return new refresh_token on refresh)
       refreshed.refresh_token = stored.refresh_token;
+      refreshed.client_id = resolvedClientId;
+      refreshed.client_secret = resolvedClientSecret;
       const path = await writeStoredGoogleToken(refreshed);
       console.log(`[calendar] Refreshed token saved to ${path}`);
       return refreshed.access_token;
     } catch (e) {
       console.warn(`[calendar] Refresh failed: ${e instanceof Error ? e.message : String(e)}`);
-      return stored.access_token; // fallback to stale token (maybe still works briefly)
+      return stored.access_token;
     }
   }
 
-  // no refresh, return stale even if expired (let API fail with clear message)
   if (stored.expires_at && stored.expires_at <= Date.now()) {
-    console.warn("[calendar] Stored access token expired and no refresh_token available. Re-run with --calendar-auth or set GOOGLE_REFRESH_TOKEN");
+    if (stored.refresh_token && (!resolvedClientId || !resolvedClientSecret)) {
+      console.warn("[calendar] Stored access token expired and refresh_token exists but GOOGLE_CLIENT_ID/SECRET not found. Set them or re-run --calendar-auth");
+    } else {
+      console.warn("[calendar] Stored access token expired and no refresh_token available. Re-run with --calendar-auth or set GOOGLE_REFRESH_TOKEN");
+    }
   }
   return stored.access_token;
 }
@@ -742,6 +753,8 @@ Alternatively, use OAuth Playground (no GCP needed, 2 min):
     scope: tokenData.scope,
     token_type: tokenData.token_type,
     obtained_at: new Date().toISOString(),
+    client_id: clientId,
+    client_secret: clientSecret,
   };
 
   const savedPath = await writeStoredGoogleToken(stored);
@@ -757,8 +770,29 @@ Alternatively, use OAuth Playground (no GCP needed, 2 min):
 
 export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions): Promise<void> {
   const events = buildCalendarEvents(usage);
+
+  // Determine which kinds are missing (reset is null) - need to delete old events for those
+  const missingKinds: Array<"five_hour" | "weekly"> = [];
+  if (!usage.five_hour?.resets_at) missingKinds.push("five_hour");
+  if (!usage.seven_day?.resets_at) missingKinds.push("weekly");
+
   if (events.length === 0) {
     console.log("[calendar] No reset times available in usage data (both resets_at are null)");
+    // Still handle deletions for both kinds if needed
+    if (missingKinds.length > 0 && opts.calendarApi) {
+      const clientId = process.env.GOOGLE_CLIENT_ID ?? process.env.GOOGLE_OAUTH_CLIENT_ID;
+      const clientSecret = process.env.GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+      const token = await getGoogleAccessToken(clientId, clientSecret);
+      if (!token) {
+        console.error("[calendar] No auth for deletion");
+        return;
+      }
+      const calendarId = opts.calendarId ?? process.env.GOOGLE_CALENDAR_ID ?? "primary";
+      for (const kind of missingKinds) {
+        const count = await deleteCalendarEventsByKind(token, calendarId, kind);
+        console.log(`[calendar] Deleted ${count} stale event(s) for ${kind} (reset is null)`);
+      }
+    }
     return;
   }
 
@@ -767,6 +801,12 @@ export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions):
     const url = buildGoogleCalendarUrl(ev);
     console.log(`  - ${ev.summary}: ${ev.startIso} (${toGoogleCalendarDate(ev.startIso)})`);
     console.log(`    Google Calendar URL: ${url}`);
+  }
+  if (missingKinds.length > 0) {
+    for (const k of missingKinds) {
+      const label = k === "five_hour" ? "5-hour" : "weekly";
+      console.log(`  - ${label}: reset is null -> existing events for ${k} will be deleted`);
+    }
   }
 
   // ICS file
@@ -799,6 +839,18 @@ export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions):
       return;
     }
     const calendarId = opts.calendarId ?? process.env.GOOGLE_CALENDAR_ID ?? "primary";
+
+    // First, delete stale events for missing kinds
+    for (const kind of missingKinds) {
+      try {
+        const count = await deleteCalendarEventsByKind(token, calendarId, kind);
+        if (count > 0) console.log(`[calendar] Deleted ${count} stale event(s) for ${kind} (reset is null)`);
+        else console.log(`[calendar] No stale events to delete for ${kind}`);
+      } catch (e) {
+        console.error(`[calendar] Failed to delete ${kind} events: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
     console.log(`[calendar] Upserting ${events.length} event(s) via API to calendar: ${calendarId} (existing events will be moved)`);
     for (const ev of events) {
       try {
@@ -810,6 +862,34 @@ export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions):
       }
     }
   }
+}
+
+export async function deleteCalendarEventsByKind(
+  accessToken: string,
+  calendarId: string,
+  kind: "five_hour" | "weekly",
+): Promise<number> {
+  const timeMin = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const timeMax = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const items = await listGoogleCalendarEvents(accessToken, calendarId, {
+    q: "Claude Code",
+    timeMin,
+    timeMax,
+    maxResults: 50,
+  });
+  const targets = items.filter((it) => {
+    if (!it.summary) return false;
+    const isSameKind =
+      (kind === "five_hour" && it.summary.includes("5-hour")) || (kind === "weekly" && it.summary.includes("weekly"));
+    if (!isSameKind) return false;
+    const marker = it.extendedProperties?.private?.source;
+    if (marker) return marker === "ccusage-notifier";
+    return true;
+  });
+  for (const it of targets) {
+    await deleteGoogleCalendarEvent(accessToken, calendarId, it.id);
+  }
+  return targets.length;
 }
 
 // ---------------------------------------------------------------------------

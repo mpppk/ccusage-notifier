@@ -221,13 +221,15 @@ bun run index.ts --watch 3600 --calendar --calendar-api
 
 保存先と優先順位:
 
-1. `GOOGLE_REFRESH_TOKEN` + `GOOGLE_CLIENT_ID/SECRET` があればその場でリフレッシュして保存
-2. `GOOGLE_OAUTH_TOKEN` env があればそれを使用（一時的、Playground等）
-3. `~/.config/ccusage-notifier/google-calendar-token.json` / `~/.ccusage-notifier-google-token.json` / `./.google-calendar-token.json` の順で読み込み、期限切れなら `refresh_token` で自動更新
+1. `GOOGLE_REFRESH_TOKEN` + `GOOGLE_CLIENT_ID/SECRET` があればその場でリフレッシュして保存（`client_id/secret` も保存）
+2. `GOOGLE_OAUTH_TOKEN` env があればそれを使用（一時的、Playground等、1時間で失効）
+3. `~/.config/ccusage-notifier/google-calendar-token.json` / `~/.ccusage-notifier-google-token.json` / `./.google-calendar-token.json` の順で読み込み、ファイル内の `client_id` / `client_secret` を使って期限切れなら `refresh_token` で自動更新（`--calendar-auth` 時に自動保存されるため env 不要）
 
 **既存予定の扱い (5h limit 更新時):** `index.ts:408` の `upsertGoogleCalendarEvent` が `q=Claude Code` で既存イベントを検索し、`extendedProperties.private.source=ccusage-notifier` + `summary` で `five_hour` / `weekly` を判別して `PATCH` で新時刻へ移動します。重複があれば先頭1件を残して他を `DELETE` で自動クリーンアップします。初回以降は毎回同じイベントが移動されるため、重複は増えません。ICSは毎回上書きされます。
 
-**注意:** OAuth同意画面が `テスト` モードの場合、`refresh_token` は7日で失効します（`refresh_token_expires_in: 604799`）。`本番環境` に公開するか、7日ごとに `bun run calendar:auth` で再認証してください。`--calendar` の `resets_at` は取得時点のスナップショットなので、時間経過で変わる場合は再実行してください。
+`resets_at` が `null` の場合（例: 5-hour が `0%` でリセット不要）は、該当 `kind` の既存予定を `DELETE` で自動削除します。`five_hour` が `0%` / `null` になった今回のケースでは、古い5-hour予定が削除され weekly のみが残ります。
+
+**注意:** OAuth同意画面が `テスト` モードの場合、`refresh_token` は7日で失効します（`refresh_token_expires_in: 604799`）。`本番環境` に公開するか、7日ごとに `bun run calendar:auth` で再認証してください。`access_token` は1時間で失効しますが、`--calendar-auth` 時に `client_id` / `client_secret` も一緒に `~/.config/ccusage-notifier/google-calendar-token.json` に保存されるため、以降は `GOOGLE_CLIENT_ID/SECRET` 環境変数なしでも自動リフレッシュされます。`--calendar` の `resets_at` は取得時点のスナップショットなので、時間経過で変わる場合は再実行してください。
 
 他の方法で手動登録したい場合は方法1/2を使ってください。
 
