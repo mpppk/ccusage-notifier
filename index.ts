@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 
 /**
- * ccusage-notifier - Claude Code usage fetcher & Google Calendar sync
+ * ccusage-notifier - Claude Code & Codex usage fetcher & Google Calendar sync
  *
- * Fetches usage via Anthropic OAuth API using the token stored in macOS Keychain.
+ * Fetches Claude via Anthropic OAuth API and Codex via ChatGPT backend wham/usage.
  */
 
 type UsageBucket = {
@@ -38,20 +38,62 @@ type ClaudeUsage = {
   [k: string]: unknown;
 };
 
+// ---------------------------------------------------------------------------
+// Codex types
+// ---------------------------------------------------------------------------
+
+export type CodexRateLimitWindow = {
+  used_percent: number | null;
+  limit_window_seconds: number | null;
+  reset_at: number | null; // epoch seconds
+  reset_after_seconds: number | null;
+};
+
+export type CodexRawUsage = {
+  plan_type?: string | null;
+  rate_limit?: {
+    allowed?: boolean;
+    limit_reached?: boolean;
+    primary_window?: CodexRateLimitWindow | null;
+    secondary_window?: CodexRateLimitWindow | null;
+  } | null;
+  credits?: unknown;
+  rate_limit_reset_credits?: unknown;
+  [k: string]: unknown;
+};
+
+export type CodexUsage = {
+  plan_type: string | null;
+  five_hour: UsageBucket | null;
+  seven_day: UsageBucket | null;
+  primary_window: CodexRateLimitWindow | null;
+  secondary_window: CodexRateLimitWindow | null;
+  raw: CodexRawUsage;
+};
+
+export type CombinedUsage = {
+  claude: ClaudeUsage | null;
+  codex: CodexUsage | null;
+};
+
 export type NotifierOptions = {
   json?: boolean;
   watchIntervalSec?: number;
-  token?: string;
+  token?: string; // claude token override
+  codexToken?: string;
   calendar?: boolean;
   calendarApi?: boolean;
   calendarId?: string;
   calendarAuth?: boolean;
   calendarAuthPort?: number;
   calendarOpen?: boolean;
+  claude?: boolean;
+  codex?: boolean;
+  all?: boolean;
 };
 
 // ---------------------------------------------------------------------------
-// Token retrieval
+// Token retrieval - Claude
 // ---------------------------------------------------------------------------
 
 export async function getClaudeToken(): Promise<string> {
@@ -93,6 +135,164 @@ export async function getClaudeToken(): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
+// Token retrieval - Codex
+// ---------------------------------------------------------------------------
+
+const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_TOKEN_URL = process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE ?? "https://auth.openai.com/oauth/token";
+const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+
+type CodexAuthFile = {
+  tokens?: {
+    id_token?: string;
+    access_token?: string;
+    refresh_token?: string;
+    account_id?: string | null;
+  };
+  OPENAI_API_KEY?: string | null;
+  auth_mode?: string;
+  last_refresh?: string | null;
+};
+
+function getCodexAuthFilePath(): string {
+  const codexHome = process.env.CODEX_HOME ?? `${process.env.HOME ?? "."}/.codex`;
+  return `${codexHome}/auth.json`;
+}
+
+async function readCodexAuthFile(): Promise<CodexAuthFile | null> {
+  const candidates = [
+    getCodexAuthFilePath(),
+    `${process.env.HOME ?? "."}/.codex/auth.json`,
+  ];
+  // dedup
+  const seen = new Set<string>();
+  for (const p of candidates) {
+    if (seen.has(p)) continue;
+    seen.add(p);
+    try {
+      const file = Bun.file(p);
+      if (await file.exists()) {
+        const json = (await file.json()) as CodexAuthFile;
+        if (json?.tokens?.access_token || json?.OPENAI_API_KEY) return json;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function writeCodexAuthFile(updated: CodexAuthFile): Promise<void> {
+  const path = getCodexAuthFilePath();
+  const dir = path.substring(0, path.lastIndexOf("/"));
+  const proc = Bun.spawn(["mkdir", "-p", dir], { stdout: "pipe", stderr: "pipe" });
+  await proc.exited;
+  // Preserve formatting similar to Codex (pretty JSON)
+  await Bun.write(path, JSON.stringify(updated, null, 2));
+  const chmod = Bun.spawn(["chmod", "600", path], { stdout: "pipe", stderr: "pipe" });
+  await chmod.exited;
+}
+
+function parseJwtExp(jwt: string): number | null {
+  try {
+    const parts = jwt.split(".");
+    if (parts.length < 2) return null;
+    const payload = parts[1]!;
+    const pad = payload.length % 4 === 0 ? "" : "=".repeat(4 - (payload.length % 4));
+    const decoded = Buffer.from(payload + pad, "base64url").toString("utf-8");
+    const obj = JSON.parse(decoded);
+    if (typeof obj.exp === "number") return obj.exp;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function isJwtExpiringSoon(jwt: string, skewSec = 600): boolean {
+  const exp = parseJwtExp(jwt);
+  if (exp == null) return false;
+  const nowSec = Math.floor(Date.now() / 1000);
+  return exp - nowSec < skewSec;
+}
+
+async function refreshCodexAccessToken(refreshToken: string): Promise<{ access_token: string; id_token?: string; refresh_token?: string }> {
+  const clientId = process.env.CODEX_APP_SERVER_LOGIN_CLIENT_ID ?? process.env.CLIENT_ID_OVERRIDE ?? CODEX_CLIENT_ID;
+  const endpoint = process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE ?? CODEX_TOKEN_URL;
+  const body = JSON.stringify({
+    client_id: clientId,
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+  });
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Codex token refresh failed: ${res.status} ${text}`);
+  }
+  const data = (await res.json()) as { access_token?: string; id_token?: string; refresh_token?: string };
+  if (!data.access_token) throw new Error("Codex refresh response missing access_token");
+  return data as { access_token: string; id_token?: string; refresh_token?: string };
+}
+
+export async function getCodexToken(): Promise<string> {
+  const envToken =
+    process.env.CODEX_ACCESS_TOKEN ??
+    process.env.OPENAI_CODEX_ACCESS_TOKEN ??
+    process.env.CODEX_BEARER_TOKEN ??
+    process.env.OPENAI_API_KEY; // fallback if user stores codex api key (will fail for wham but try)
+  if (envToken) {
+    const trimmed = envToken.trim();
+    if (trimmed) return trimmed;
+  }
+
+  const authFile = await readCodexAuthFile();
+  if (!authFile) {
+    throw new Error(
+      `Codex auth not found at ${getCodexAuthFilePath()}. Run "codex login" or set CODEX_ACCESS_TOKEN env var.`,
+    );
+  }
+  // If API key mode, just return it (though wham may not work)
+  if (authFile.OPENAI_API_KEY && !authFile.tokens?.access_token) {
+    return authFile.OPENAI_API_KEY;
+  }
+  const tokens = authFile.tokens;
+  if (!tokens?.access_token) {
+    throw new Error(`Codex auth file ${getCodexAuthFilePath()} missing tokens.access_token`);
+  }
+  // Proactive refresh if expiring soon and refresh_token available
+  if (tokens.refresh_token && isJwtExpiringSoon(tokens.access_token, 600)) {
+    try {
+      console.log("[codex] Access token expiring soon, refreshing...");
+      const refreshed = await refreshCodexAccessToken(tokens.refresh_token);
+      const updated: CodexAuthFile = {
+        ...authFile,
+        tokens: {
+          ...tokens,
+          access_token: refreshed.access_token,
+          ...(refreshed.id_token ? { id_token: refreshed.id_token } : {}),
+          ...(refreshed.refresh_token ? { refresh_token: refreshed.refresh_token } : {}),
+        },
+        last_refresh: new Date().toISOString(),
+      };
+      await writeCodexAuthFile(updated);
+      console.log("[codex] Token refreshed and saved");
+      return refreshed.access_token;
+    } catch (e) {
+      console.warn(`[codex] Proactive refresh failed: ${e instanceof Error ? e.message : String(e)}, using existing token`);
+    }
+  }
+  return tokens.access_token;
+}
+
+export async function getCodexAccountId(): Promise<string | null> {
+  const envId = process.env.CHATGPT_ACCOUNT_ID ?? process.env.OPENAI_ACCOUNT_ID;
+  if (envId) return envId;
+  const authFile = await readCodexAuthFile();
+  return authFile?.tokens?.account_id ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // Usage fetch
 // ---------------------------------------------------------------------------
 
@@ -108,6 +308,106 @@ export async function getClaudeUsage(token: string): Promise<ClaudeUsage> {
     throw new Error(`usage fetch failed: ${res.status} ${body}`);
   }
   return (await res.json()) as ClaudeUsage;
+}
+
+function codexEpochToIso(epoch: number | null | undefined): string | null {
+  if (epoch == null) return null;
+  // epoch is seconds since unix epoch
+  const ms = epoch * 1000;
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+function normalizeCodexUsage(raw: CodexRawUsage): CodexUsage {
+  const primary = raw.rate_limit?.primary_window ?? null;
+  const secondary = raw.rate_limit?.secondary_window ?? null;
+
+  const toBucket = (w: CodexRateLimitWindow | null | undefined): UsageBucket | null => {
+    if (!w) return null;
+    // used_percent present, reset_at is epoch seconds
+    const utilization = w.used_percent ?? null;
+    const resets_at = codexEpochToIso(w.reset_at ?? null);
+    return { utilization, resets_at };
+  };
+
+  // Heuristic: primary is 5h (18000s), secondary is weekly (604800s)
+  // But if backend flips, we can detect via window_seconds
+  let fiveHourRaw = primary;
+  let weeklyRaw = secondary;
+  // If window sizes hint differently, swap
+  if (primary && secondary) {
+    const pSec = primary.limit_window_seconds;
+    const sSec = secondary.limit_window_seconds;
+    if (pSec === 604800 && sSec === 18000) {
+      fiveHourRaw = secondary;
+      weeklyRaw = primary;
+    }
+  }
+
+  return {
+    plan_type: (raw.plan_type as string) ?? null,
+    five_hour: toBucket(fiveHourRaw),
+    seven_day: toBucket(weeklyRaw),
+    primary_window: primary ?? null,
+    secondary_window: secondary ?? null,
+    raw,
+  };
+}
+
+export async function getCodexUsage(token: string, accountId?: string | null): Promise<CodexUsage> {
+  const attemptFetch = async (tok: string): Promise<CodexRawUsage> => {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${tok}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "OpenAI-Beta": "codex-1",
+      originator: "codex_cli_rs",
+    };
+    const resolvedAccountId = accountId ?? (await getCodexAccountId());
+    if (resolvedAccountId) headers["ChatGPT-Account-ID"] = resolvedAccountId;
+    const res = await fetch(CODEX_USAGE_URL, { headers });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`codex usage fetch failed: ${res.status} ${body}`);
+    }
+    return (await res.json()) as CodexRawUsage;
+  };
+
+  try {
+    const raw = await attemptFetch(token);
+    return normalizeCodexUsage(raw);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const isAuthError = msg.includes("401") || msg.toLowerCase().includes("unauthorized") || msg.includes("403");
+    if (!isAuthError) throw e;
+    // Try refresh flow if we have a refresh_token
+    const authFile = await readCodexAuthFile();
+    const refreshToken = authFile?.tokens?.refresh_token;
+    if (!refreshToken) throw e;
+    // Avoid infinite loop: only try once
+    console.log("[codex] Usage fetch auth failed, attempting token refresh...");
+    try {
+      const refreshed = await refreshCodexAccessToken(refreshToken);
+      const updated: CodexAuthFile = {
+        ...(authFile as CodexAuthFile),
+        tokens: {
+          ...(authFile!.tokens as NonNullable<CodexAuthFile["tokens"]>),
+          access_token: refreshed.access_token,
+          ...(refreshed.id_token ? { id_token: refreshed.id_token } : {}),
+          ...(refreshed.refresh_token ? { refresh_token: refreshed.refresh_token } : {}),
+        },
+        last_refresh: new Date().toISOString(),
+      };
+      await writeCodexAuthFile(updated);
+      console.log("[codex] Token refreshed after 401, retrying usage fetch...");
+      const raw2 = await attemptFetch(refreshed.access_token);
+      return normalizeCodexUsage(raw2);
+    } catch (refreshErr) {
+      console.warn(`[codex] Refresh after 401 failed: ${refreshErr instanceof Error ? refreshErr.message : String(refreshErr)}`);
+      throw e;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +479,56 @@ export function formatUsage(usage: ClaudeUsage): string {
   return lines.join("\n");
 }
 
+export function formatCodexUsage(usage: CodexUsage): string {
+  const five = usage.five_hour;
+  const seven = usage.seven_day;
+  const lines: string[] = [];
+  const planLabel = usage.plan_type ? ` (${usage.plan_type})` : "";
+  lines.push(`Codex Usage${planLabel}`);
+  lines.push("────────────────────────────────────────");
+  // Codex primary = 5h session
+  lines.push(
+    `${severityEmoji(five?.utilization)} 5-hour : ${five?.utilization ?? "-"}% ${bar(five?.utilization)}  reset: ${formatResetsAt(five?.resets_at)}`,
+  );
+  lines.push(
+    `${severityEmoji(seven?.utilization)} weekly : ${seven?.utilization ?? "-"}% ${bar(seven?.utilization)}  reset: ${formatResetsAt(seven?.resets_at)}`,
+  );
+  if (usage.raw.rate_limit) {
+    const rl = usage.raw.rate_limit as { allowed?: boolean; limit_reached?: boolean };
+    if (rl.allowed != null || rl.limit_reached != null) {
+      lines.push(`   allowed: ${rl.allowed ?? "-"}  limit_reached: ${rl.limit_reached ?? "-"}`);
+    }
+  }
+  // Show raw windows if present for debugging
+  if (usage.primary_window || usage.secondary_window) {
+    const pw = usage.primary_window;
+    const sw = usage.secondary_window;
+    if (pw) lines.push(`   primary_window: ${pw.used_percent ?? "-"}% window=${pw.limit_window_seconds ?? "-"}s reset=${formatResetsAt(codexEpochToIso(pw.reset_at))}`);
+    if (sw) lines.push(`   secondary_window: ${sw.used_percent ?? "-"}% window=${sw.limit_window_seconds ?? "-"}s reset=${formatResetsAt(codexEpochToIso(sw.reset_at))}`);
+  }
+  return lines.join("\n");
+}
+
+export function formatCombinedUsage(combined: CombinedUsage): string {
+  const parts: string[] = [];
+  if (combined.claude) {
+    parts.push(formatUsage(combined.claude));
+  } else {
+    parts.push("Claude Code Usage\n────────────────────────────────────────\n(unavailable - no auth or fetch failed)");
+  }
+  if (combined.codex) {
+    if (parts.length > 0) parts.push("");
+    parts.push(formatCodexUsage(combined.codex));
+  } else {
+    if (combined.claude) {
+      // when default both, show placeholder if codex missing but claude succeeded? Only if codex was requested
+      // handled by caller printing warnings
+    }
+  }
+  // If both null, caller would have errored
+  return parts.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Google Calendar integration
 // ---------------------------------------------------------------------------
@@ -188,7 +538,8 @@ export type CalendarEventInput = {
   description: string;
   startIso: string;
   durationMinutes?: number;
-  kind?: "five_hour" | "weekly";
+  kind?: "five_hour" | "weekly" | "codex_five_hour" | "codex_weekly";
+  product?: "claude" | "codex";
 };
 
 function toGoogleCalendarDate(iso: string): string {
@@ -225,6 +576,7 @@ export function buildCalendarEvents(usage: ClaudeUsage): CalendarEventInput[] {
       startIso: usage.five_hour.resets_at,
       durationMinutes: 15,
       kind: "five_hour",
+      product: "claude",
     });
   }
   if (usage.seven_day?.resets_at) {
@@ -235,8 +587,43 @@ export function buildCalendarEvents(usage: ClaudeUsage): CalendarEventInput[] {
       startIso: usage.seven_day.resets_at,
       durationMinutes: 15,
       kind: "weekly",
+      product: "claude",
     });
   }
+  return events;
+}
+
+export function buildCodexCalendarEvents(usage: CodexUsage): CalendarEventInput[] {
+  const events: CalendarEventInput[] = [];
+  if (usage.five_hour?.resets_at) {
+    const util = usage.five_hour.utilization;
+    events.push({
+      summary: "Codex 5-hour limit reset",
+      description: `Codex 5-hour usage ${util ?? "-"}% resets. Weekly: ${usage.seven_day?.utilization ?? "-"}%. Plan: ${usage.plan_type ?? "-"}`,
+      startIso: usage.five_hour.resets_at,
+      durationMinutes: 15,
+      kind: "codex_five_hour",
+      product: "codex",
+    });
+  }
+  if (usage.seven_day?.resets_at) {
+    const util = usage.seven_day.utilization;
+    events.push({
+      summary: "Codex weekly limit reset",
+      description: `Codex weekly usage ${util ?? "-"}% resets. 5-hour: ${usage.five_hour?.utilization ?? "-"}%. Plan: ${usage.plan_type ?? "-"}`,
+      startIso: usage.seven_day.resets_at,
+      durationMinutes: 15,
+      kind: "codex_weekly",
+      product: "codex",
+    });
+  }
+  return events;
+}
+
+export function buildCombinedCalendarEvents(combined: CombinedUsage): CalendarEventInput[] {
+  const events: CalendarEventInput[] = [];
+  if (combined.claude) events.push(...buildCalendarEvents(combined.claude));
+  if (combined.codex) events.push(...buildCodexCalendarEvents(combined.codex));
   return events;
 }
 
@@ -247,6 +634,8 @@ export async function insertGoogleCalendarEvent(
 ): Promise<unknown> {
   const start = new Date(event.startIso);
   const end = new Date(start.getTime() + (event.durationMinutes ?? 15) * 60 * 1000);
+  const kind = event.kind ?? (event.summary.includes("weekly") ? "weekly" : "five_hour");
+  const product = event.product ?? (event.summary.includes("Codex") ? "codex" : "claude");
   const body: Record<string, unknown> = {
     summary: event.summary,
     description: event.description,
@@ -256,7 +645,8 @@ export async function insertGoogleCalendarEvent(
     extendedProperties: {
       private: {
         source: "ccusage-notifier",
-        kind: event.kind ?? (event.summary.includes("weekly") ? "weekly" : "five_hour"),
+        kind,
+        product,
       },
     },
   };
@@ -283,6 +673,8 @@ export async function patchGoogleCalendarEvent(
 ): Promise<unknown> {
   const start = new Date(event.startIso);
   const end = new Date(start.getTime() + (event.durationMinutes ?? 15) * 60 * 1000);
+  const kind = event.kind ?? (event.summary.includes("weekly") ? "weekly" : "five_hour");
+  const product = event.product ?? (event.summary.includes("Codex") ? "codex" : "claude");
   const body: Record<string, unknown> = {
     summary: event.summary,
     description: event.description,
@@ -292,7 +684,8 @@ export async function patchGoogleCalendarEvent(
     extendedProperties: {
       private: {
         source: "ccusage-notifier",
-        kind: event.kind ?? (event.summary.includes("weekly") ? "weekly" : "five_hour"),
+        kind,
+        product,
       },
     },
   };
@@ -347,21 +740,51 @@ export async function upsertGoogleCalendarEvent(
   event: CalendarEventInput,
 ): Promise<{ action: "created" | "updated" | "moved" | "skipped"; id: string; htmlLink?: string }> {
   const kind = event.kind ?? (event.summary.includes("weekly") ? "weekly" : "five_hour");
+  const product = event.product ?? (event.summary.includes("Codex") ? "codex" : "claude");
   const timeMin = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const timeMax = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  // Choose query based on product
+  const query = product === "codex" ? "Codex" : "Claude Code";
   const items = await listGoogleCalendarEvents(accessToken, calendarId, {
-    q: "Claude Code",
+    q: query,
     timeMin,
     timeMax,
     maxResults: 50,
   });
 
+  const normalizeKind = (k: string) => k.replace(/^codex_/, "");
+  const expectedNorm = normalizeKind(kind);
+
   const candidates = items.filter((it) => {
     if (!it.summary) return false;
+    const priv = it.extendedProperties?.private;
+    const marker = priv?.source;
+    const p = priv?.product;
+    const k = priv?.kind;
+    // If event has explicit product/kind in extendedProperties, match strictly
+    if (p) {
+      if (p !== product) return false;
+      if (k && normalizeKind(k) !== expectedNorm) return false;
+      // summary should match expected product prefix
+      if (product === "codex" && !it.summary.includes("Codex")) return false;
+      if (product === "claude" && !it.summary.includes("Claude Code")) return false;
+      // kind vs summary
+      const isKindMatch = (expectedNorm === "five_hour" && it.summary.includes("5-hour")) || (expectedNorm === "weekly" && it.summary.includes("weekly"));
+      if (!isKindMatch) return false;
+      if (marker) return marker === "ccusage-notifier";
+      return true;
+    }
+    // Legacy fallback: no product marker
+    if (marker && marker !== "ccusage-notifier") return false;
+    // Must match product by summary
+    if (product === "codex") {
+      if (!it.summary.includes("Codex")) return false;
+    } else {
+      if (!it.summary.includes("Claude Code")) return false;
+    }
     const isSameKind =
-      (kind === "five_hour" && it.summary.includes("5-hour")) || (kind === "weekly" && it.summary.includes("weekly"));
+      (expectedNorm === "five_hour" && it.summary.includes("5-hour")) || (expectedNorm === "weekly" && it.summary.includes("weekly"));
     if (!isSameKind) return false;
-    const marker = it.extendedProperties?.private?.source;
     if (marker) return marker === "ccusage-notifier";
     return true;
   });
@@ -736,27 +1159,54 @@ export async function ensureFiveHourReset(
   return usage;
 }
 
-export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions): Promise<void> {
-  let effectiveUsage = usage;
-  if (!usage.five_hour?.resets_at && opts.calendar) {
-    const isZero = (usage.five_hour?.utilization ?? 0) === 0;
+export async function handleCalendar(combinedOrClaude: CombinedUsage | ClaudeUsage, opts: NotifierOptions): Promise<void> {
+  // Back-compat: allow passing ClaudeUsage directly
+  let combined: CombinedUsage;
+  if (
+    combinedOrClaude &&
+    typeof combinedOrClaude === "object" &&
+    "claude" in (combinedOrClaude as Record<string, unknown>) &&
+    "codex" in (combinedOrClaude as Record<string, unknown>)
+  ) {
+    combined = combinedOrClaude as CombinedUsage;
+  } else {
+    combined = { claude: combinedOrClaude as ClaudeUsage, codex: null };
+  }
+  // Handle Claude 5h null auto-ping
+  let effectiveCombined = { ...combined };
+  if (combined.claude && !combined.claude.five_hour?.resets_at && opts.calendar) {
+    const isZero = (combined.claude.five_hour?.utilization ?? 0) === 0;
     if (isZero) {
       try {
         const claudeToken = opts.token ?? (await getClaudeToken());
-        effectiveUsage = await ensureFiveHourReset(usage, claudeToken);
+        effectiveCombined.claude = await ensureFiveHourReset(combined.claude, claudeToken);
       } catch (e) {
         console.warn(`[calendar] ensureFiveHourReset failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   }
 
-  const events = buildCalendarEvents(effectiveUsage);
-  const missingKinds: Array<"five_hour" | "weekly"> = [];
-  if (!effectiveUsage.seven_day?.resets_at) missingKinds.push("weekly");
+  const events = buildCombinedCalendarEvents(effectiveCombined);
+  // Determine missing kinds per product
+  type KindWithProduct = { kind: "five_hour" | "weekly" | "codex_five_hour" | "codex_weekly"; product: "claude" | "codex" };
+  const missing: KindWithProduct[] = [];
+  if (effectiveCombined.claude) {
+    if (!effectiveCombined.claude.seven_day?.resets_at) missing.push({ kind: "weekly", product: "claude" });
+    if (!effectiveCombined.claude.five_hour?.resets_at) missing.push({ kind: "five_hour", product: "claude" });
+  }
+  // For Codex, if we requested codex but have null resets, we also consider missing
+  if (effectiveCombined.codex) {
+    if (!effectiveCombined.codex.five_hour?.resets_at) missing.push({ kind: "codex_five_hour", product: "codex" });
+    if (!effectiveCombined.codex.seven_day?.resets_at) missing.push({ kind: "codex_weekly", product: "codex" });
+  } else if (opts.codex && events.length === 0) {
+    // If codex requested but no usage, no events; but we still want to note
+  }
 
-  if (events.length === 0) {
-    console.log("[calendar] No reset times available in usage data (both resets_at are null)");
-    if (missingKinds.length > 0 && opts.calendarApi) {
+  // If effective has no events at all but some product had usage null, we still need to report
+  const hasEvents = events.length > 0;
+  if (!hasEvents) {
+    console.log("[calendar] No reset times available in usage data (all resets_at are null)");
+    if (missing.length > 0 && opts.calendarApi) {
       const clientId = process.env.GOOGLE_CLIENT_ID ?? process.env.GOOGLE_OAUTH_CLIENT_ID;
       const clientSecret = process.env.GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_OAUTH_CLIENT_SECRET;
       const token = await getGoogleAccessToken(clientId, clientSecret);
@@ -765,9 +1215,9 @@ export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions):
         return;
       }
       const calendarId = opts.calendarId ?? process.env.GOOGLE_CALENDAR_ID ?? "primary";
-      for (const kind of missingKinds) {
-        const count = await deleteCalendarEventsByKind(token, calendarId, kind);
-        console.log(`[calendar] Deleted ${count} stale event(s) for ${kind} (reset is null)`);
+      for (const m of missing) {
+        const count = await deleteCalendarEventsByKind(token, calendarId, m.kind, m.product);
+        console.log(`[calendar] Deleted ${count} stale event(s) for ${m.product}/${m.kind} (reset is null)`);
       }
     }
     return;
@@ -779,10 +1229,17 @@ export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions):
     console.log(`  - ${ev.summary}: ${ev.startIso} (${toGoogleCalendarDate(ev.startIso)})`);
     console.log(`    Google Calendar URL: ${url}`);
   }
-  if (missingKinds.length > 0) {
-    for (const k of missingKinds) {
-      const label = k === "five_hour" ? "5-hour" : "weekly";
-      console.log(`  - ${label}: reset is null -> existing events for ${k} will be deleted`);
+  if (missing.length > 0) {
+    for (const k of missing) {
+      // Only print missing if that product had some events? Actually we printed events; missing ones are those with null reset
+      // To avoid noise when codex not requested, only print if that product was in combined
+      const hasProductEvents = events.some((e) => e.product === k.product);
+      if (!hasProductEvents && k.product === "codex" && !effectiveCombined.codex) continue;
+      if (!hasProductEvents && k.product === "claude" && !effectiveCombined.claude) continue;
+      // But we already have filtered: if product's both resets null, hasProductEvents false, we still want to note deletion
+      // So we print regardless if that product had any usage object
+      const label = k.kind.includes("five_hour") ? "5-hour" : "weekly";
+      console.log(`  - ${k.product} ${label}: reset is null -> existing events for ${k.product}/${k.kind} will be deleted`);
     }
   }
 
@@ -808,13 +1265,13 @@ export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions):
     }
     const calendarId = opts.calendarId ?? process.env.GOOGLE_CALENDAR_ID ?? "primary";
 
-    for (const kind of missingKinds) {
+    for (const m of missing) {
       try {
-        const count = await deleteCalendarEventsByKind(token, calendarId, kind);
-        if (count > 0) console.log(`[calendar] Deleted ${count} stale event(s) for ${kind} (reset is null)`);
-        else console.log(`[calendar] No stale events to delete for ${kind}`);
+        const count = await deleteCalendarEventsByKind(token, calendarId, m.kind, m.product);
+        if (count > 0) console.log(`[calendar] Deleted ${count} stale event(s) for ${m.product}/${m.kind} (reset is null)`);
+        else console.log(`[calendar] No stale events to delete for ${m.product}/${m.kind}`);
       } catch (e) {
-        console.error(`[calendar] Failed to delete ${kind} events: ${e instanceof Error ? e.message : String(e)}`);
+        console.error(`[calendar] Failed to delete ${m.product}/${m.kind} events: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
 
@@ -838,25 +1295,54 @@ export async function handleCalendar(usage: ClaudeUsage, opts: NotifierOptions):
   }
 }
 
+// Backwards compat: allow old signature handleCalendar(usage, opts) where usage is ClaudeUsage
+export async function handleCalendarLegacy(usage: ClaudeUsage, opts: NotifierOptions): Promise<void> {
+  return handleCalendar({ claude: usage, codex: null }, opts);
+}
+
 export async function deleteCalendarEventsByKind(
   accessToken: string,
   calendarId: string,
-  kind: "five_hour" | "weekly",
+  kind: "five_hour" | "weekly" | "codex_five_hour" | "codex_weekly",
+  product: "claude" | "codex" = "claude",
 ): Promise<number> {
   const timeMin = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const timeMax = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const q = product === "codex" ? "Codex" : "Claude Code";
   const items = await listGoogleCalendarEvents(accessToken, calendarId, {
-    q: "Claude Code",
+    q,
     timeMin,
     timeMax,
     maxResults: 50,
   });
+  const norm = (k: string) => k.replace(/^codex_/, "");
+  const expectedNorm = norm(kind);
   const targets = items.filter((it) => {
     if (!it.summary) return false;
+    const priv = it.extendedProperties?.private;
+    const p = priv?.product;
+    const k = priv?.kind;
+    const marker = priv?.source;
+    // If product present, require match
+    if (p) {
+      if (p !== product) return false;
+      if (k && norm(k) !== expectedNorm) return false;
+      const isSameKind = (expectedNorm === "five_hour" && it.summary.includes("5-hour")) || (expectedNorm === "weekly" && it.summary.includes("weekly"));
+      if (!isSameKind) return false;
+      if (product === "codex" && !it.summary.includes("Codex")) return false;
+      if (product === "claude" && !it.summary.includes("Claude Code")) return false;
+      if (marker) return marker === "ccusage-notifier";
+      return true;
+    }
+    // legacy
+    if (product === "codex") {
+      if (!it.summary.includes("Codex")) return false;
+    } else {
+      if (!it.summary.includes("Claude Code")) return false;
+    }
     const isSameKind =
-      (kind === "five_hour" && it.summary.includes("5-hour")) || (kind === "weekly" && it.summary.includes("weekly"));
+      (expectedNorm === "five_hour" && it.summary.includes("5-hour")) || (expectedNorm === "weekly" && it.summary.includes("weekly"));
     if (!isSameKind) return false;
-    const marker = it.extendedProperties?.private?.source;
     if (marker) return marker === "ccusage-notifier";
     return true;
   });
@@ -885,7 +1371,20 @@ function parseArgs(argv: string[]): NotifierOptions & { help?: boolean; once?: b
     else if (a.startsWith("--calendar-id=")) opts.calendarId = a.split("=").slice(1).join("=");
     else if (a.startsWith("--calendar-auth-port=")) opts.calendarAuthPort = Number(a.split("=").slice(1).join("="));
     else if (a === "--calendar-auth-port") opts.calendarAuthPort = Number(argv[++i]);
-    else if (a === "--watch" || a === "-w") {
+    else if (a === "--claude") opts.claude = true;
+    else if (a === "--codex") opts.codex = true;
+    else if (a === "--all") opts.all = true;
+    else if (a === "--provider" || a === "--service") {
+      const v = argv[++i]?.toLowerCase();
+      if (v === "claude") opts.claude = true;
+      else if (v === "codex") opts.codex = true;
+      else if (v === "all" || v === "both") opts.all = true;
+    } else if (a.startsWith("--provider=") || a.startsWith("--service=")) {
+      const v = a.split("=").slice(1).join("=").toLowerCase();
+      if (v === "claude") opts.claude = true;
+      else if (v === "codex") opts.codex = true;
+      else if (v === "all" || v === "both") opts.all = true;
+    } else if (a === "--watch" || a === "-w") {
       const next = argv[i + 1];
       if (next && !next.startsWith("-") && !isNaN(Number(next))) {
         opts.watchIntervalSec = Number(argv[++i]);
@@ -900,12 +1399,33 @@ function parseArgs(argv: string[]): NotifierOptions & { help?: boolean; once?: b
   }
   if (opts.calendarOpen) opts.calendar = true;
   if (opts.calendarApi) opts.calendar = true;
+  // Resolve provider selection
+  const hasClaudeFlag = opts.claude === true;
+  const hasCodexFlag = opts.codex === true;
+  const hasAllFlag = opts.all === true;
+  if (!hasClaudeFlag && !hasCodexFlag && !hasAllFlag) {
+    // default: both
+    opts.claude = true;
+    opts.codex = true;
+  } else if (hasAllFlag) {
+    opts.claude = true;
+    opts.codex = true;
+  } else {
+    // explicit flags only
+    opts.claude = hasClaudeFlag;
+    opts.codex = hasCodexFlag;
+    // if both flags were passed, both true already
+    if (hasClaudeFlag && hasCodexFlag) {
+      opts.claude = true;
+      opts.codex = true;
+    }
+  }
   return opts;
 }
 
 function printHelp() {
   console.log(`
-ccusage-notifier - Claude Code usage fetcher & Google Calendar sync
+ccusage-notifier - Claude Code & Codex usage fetcher & Google Calendar sync
 
 Usage:
   bun run index.ts [options]
@@ -914,6 +1434,10 @@ Options:
   --json                          Output raw JSON instead of pretty table
   --watch [sec]                   Poll every <sec> seconds (default 300) until Ctrl+C
   --interval <sec>                Alias for --watch
+  --claude                        Show only Claude Code usage
+  --codex                         Show only Codex usage
+  --all                           Show both Claude and Codex (default)
+  --provider <claude|codex|all>   Alias for --claude/--codex/--all
   --calendar                      Generate Google Calendar events for reset times
   --calendar-open                 Also open Google Calendar template URL in browser
   --calendar-api                  Sync events via Google Calendar API (refresh_token only)
@@ -925,7 +1449,11 @@ Options:
   -h, --help                      Show this help
 
 Env:
-  CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_OAUTH_TOKEN / CLAUDE_TOKEN  Override keychain token
+  CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_OAUTH_TOKEN / CLAUDE_TOKEN  Override claude keychain token
+  CODEX_ACCESS_TOKEN / OPENAI_CODEX_ACCESS_TOKEN / CODEX_BEARER_TOKEN  Override Codex token (else ~/.codex/auth.json)
+  CODEX_HOME                      Path to Codex home (default ~/.codex)
+  CHATGPT_ACCOUNT_ID              Override Codex account ID
+  CODEX_REFRESH_TOKEN_URL_OVERRIDE  Override Codex refresh endpoint
   GOOGLE_REFRESH_TOKEN            Refresh token for --calendar-api (with GOOGLE_CLIENT_ID/SECRET)
   GOOGLE_CALENDAR_ID              Default calendar ID (default: primary)
   GOOGLE_CLIENT_ID / GOOGLE_OAUTH_CLIENT_ID
@@ -933,41 +1461,189 @@ Env:
 
 Examples:
   bun run index.ts
-  bun run index.ts --json
+  bun run index.ts --codex --json
+  bun run index.ts --claude --json
+  bun run index.ts --json                 # both
   bun run index.ts --watch 300 --calendar --calendar-api
   bun run index.ts --calendar
   bun run index.ts --calendar --calendar-open
   bun run index.ts --calendar --calendar-api --calendar-id primary
+  bun run index.ts --codex --calendar --calendar-api
   # First time OAuth (refresh_token):
   GOOGLE_CLIENT_ID=xxx.apps.googleusercontent.com GOOGLE_CLIENT_SECRET=GOCSPX-xxx bun run index.ts --calendar-auth
   bun run index.ts --calendar --calendar-api
 `);
 }
 
-async function runOnce(opts: NotifierOptions): Promise<ClaudeUsage> {
-  const token = opts.token ?? (await getClaudeToken());
-  const usage = await getClaudeUsage(token);
+async function runOnce(opts: NotifierOptions): Promise<CombinedUsage> {
+  let claudeUsage: ClaudeUsage | null = null;
+  let codexUsage: CodexUsage | null = null;
+  let claudeError: string | null = null;
+  let codexError: string | null = null;
+
+  const shouldFetchClaude = opts.claude === true;
+  const shouldFetchCodex = opts.codex === true;
+
+  if (shouldFetchClaude) {
+    try {
+      const token = opts.token ?? (await getClaudeToken());
+      claudeUsage = await getClaudeUsage(token);
+    } catch (e) {
+      claudeError = e instanceof Error ? e.message : String(e);
+      // If only claude requested, we will handle error after both fetches
+      console.warn(`[claude] fetch failed: ${claudeError}`);
+    }
+  }
+
+  if (shouldFetchCodex) {
+    try {
+      const token = opts.codexToken ?? (await getCodexToken());
+      const accountId = await getCodexAccountId();
+      codexUsage = await getCodexUsage(token, accountId);
+    } catch (e) {
+      codexError = e instanceof Error ? e.message : String(e);
+      console.warn(`[codex] fetch failed: ${codexError}`);
+    }
+  }
+
+  if (!claudeUsage && !codexUsage) {
+    // Both failed or nothing requested
+    if (shouldFetchClaude && shouldFetchCodex) {
+      throw new Error(`Both Claude and Codex fetch failed:\n  claude: ${claudeError ?? "unknown"}\n  codex: ${codexError ?? "unknown"}`);
+    } else if (shouldFetchClaude) {
+      throw new Error(`Claude fetch failed: ${claudeError ?? "unknown"}`);
+    } else if (shouldFetchCodex) {
+      throw new Error(`Codex fetch failed: ${codexError ?? "unknown"}`);
+    } else {
+      throw new Error("No provider selected");
+    }
+  }
+
+  const combined: CombinedUsage = { claude: claudeUsage, codex: codexUsage };
 
   if (opts.json) {
-    console.log(JSON.stringify(usage, null, 2));
+    // Output combined JSON: preserve raw shapes plus normalized summary
+    const out: Record<string, unknown> = {};
+    if (claudeUsage) out.claude = claudeUsage;
+    if (codexUsage) out.codex = codexUsage.raw ?? codexUsage;
+    // Also include normalized convenience fields
+    out.combined = {
+      claude: claudeUsage
+        ? {
+            fiveHourUsed: claudeUsage.five_hour?.utilization,
+            fiveHourReset: claudeUsage.five_hour?.resets_at,
+            weekUsed: claudeUsage.seven_day?.utilization,
+            weekReset: claudeUsage.seven_day?.resets_at,
+          }
+        : null,
+      codex: codexUsage
+        ? {
+            fiveHourUsed: codexUsage.five_hour?.utilization,
+            fiveHourReset: codexUsage.five_hour?.resets_at,
+            weekUsed: codexUsage.seven_day?.utilization,
+            weekReset: codexUsage.seven_day?.resets_at,
+            plan: codexUsage.plan_type,
+          }
+        : null,
+    };
+    // Backward compat: if only claude, also output top-level raw for existing scripts
+    if (claudeUsage && !codexUsage) {
+      // keep original top-level as claude raw for compatibility
+      console.log(JSON.stringify(claudeUsage, null, 2));
+    } else if (!claudeUsage && codexUsage) {
+      console.log(JSON.stringify(out.codex, null, 2));
+    } else {
+      // Both providers: include legacy flat fields for Claude for backward compat,
+      // plus codex-prefixed fields
+      if (claudeUsage) {
+        out.fiveHourUsed = claudeUsage.five_hour?.utilization;
+        out.fiveHourReset = claudeUsage.five_hour?.resets_at;
+        out.weekUsed = claudeUsage.seven_day?.utilization;
+        out.weekReset = claudeUsage.seven_day?.resets_at;
+      }
+      if (codexUsage) {
+        out.codexFiveHourUsed = codexUsage.five_hour?.utilization;
+        out.codexFiveHourReset = codexUsage.five_hour?.resets_at;
+        out.codexWeekUsed = codexUsage.seven_day?.utilization;
+        out.codexWeekReset = codexUsage.seven_day?.resets_at;
+        out.codexPlan = codexUsage.plan_type;
+      }
+      console.log(JSON.stringify(out, null, 2));
+    }
   } else {
-    console.log(formatUsage(usage));
+    // Pretty table
+    if (claudeUsage && codexUsage) {
+      console.log(formatCombinedUsage(combined));
+    } else if (claudeUsage) {
+      console.log(formatUsage(claudeUsage));
+    } else if (codexUsage) {
+      console.log(formatCodexUsage(codexUsage));
+    }
     console.log("");
-    console.log(
-      JSON.stringify({
-        fiveHourUsed: usage.five_hour?.utilization,
-        fiveHourReset: usage.five_hour?.resets_at,
-        weekUsed: usage.seven_day?.utilization,
-        weekReset: usage.seven_day?.resets_at,
-      }),
-    );
+    // Also print minimal JSON line for scripting (combined)
+    const summary: Record<string, unknown> = {};
+    if (claudeUsage) {
+      summary.claude = {
+        fiveHourUsed: claudeUsage.five_hour?.utilization,
+        fiveHourReset: claudeUsage.five_hour?.resets_at,
+        weekUsed: claudeUsage.seven_day?.utilization,
+        weekReset: claudeUsage.seven_day?.resets_at,
+      };
+    }
+    if (codexUsage) {
+      summary.codex = {
+        fiveHourUsed: codexUsage.five_hour?.utilization,
+        fiveHourReset: codexUsage.five_hour?.resets_at,
+        weekUsed: codexUsage.seven_day?.utilization,
+        weekReset: codexUsage.seven_day?.resets_at,
+        plan: codexUsage.plan_type,
+      };
+    }
+    // If single provider, keep legacy flat shape as well for backward compat
+    if (claudeUsage && !codexUsage) {
+      console.log(
+        JSON.stringify({
+          fiveHourUsed: claudeUsage.five_hour?.utilization,
+          fiveHourReset: claudeUsage.five_hour?.resets_at,
+          weekUsed: claudeUsage.seven_day?.utilization,
+          weekReset: claudeUsage.seven_day?.resets_at,
+        }),
+      );
+    } else if (!claudeUsage && codexUsage) {
+      console.log(
+        JSON.stringify({
+          fiveHourUsed: codexUsage.five_hour?.utilization,
+          fiveHourReset: codexUsage.five_hour?.resets_at,
+          weekUsed: codexUsage.seven_day?.utilization,
+          weekReset: codexUsage.seven_day?.resets_at,
+          plan: codexUsage.plan_type,
+        }),
+      );
+    } else {
+      // Both providers: keep nested plus legacy flat for Claude for backward compat
+      const legacySummary: Record<string, unknown> = {
+        ...summary,
+        fiveHourUsed: claudeUsage?.five_hour?.utilization,
+        fiveHourReset: claudeUsage?.five_hour?.resets_at,
+        weekUsed: claudeUsage?.seven_day?.utilization,
+        weekReset: claudeUsage?.seven_day?.resets_at,
+        codexFiveHourUsed: codexUsage?.five_hour?.utilization,
+        codexFiveHourReset: codexUsage?.five_hour?.resets_at,
+        codexWeekUsed: codexUsage?.seven_day?.utilization,
+        codexWeekReset: codexUsage?.seven_day?.resets_at,
+      };
+      console.log(JSON.stringify(legacySummary));
+    }
+    // Warnings for partial failures
+    if (claudeError && shouldFetchClaude && !claudeUsage) console.warn(`[claude] ${claudeError}`);
+    if (codexError && shouldFetchCodex && !codexUsage) console.warn(`[codex] ${codexError}`);
   }
 
   if (opts.calendar) {
-    await handleCalendar(usage, opts);
+    await handleCalendar(combined, opts);
   }
 
-  return usage;
+  return combined;
 }
 
 // Only run CLI when executed directly (not imported)
