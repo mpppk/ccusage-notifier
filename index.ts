@@ -96,6 +96,199 @@ export type NotifierOptions = {
 // Token retrieval - Claude
 // ---------------------------------------------------------------------------
 
+const CLAUDE_CLIENT_ID =
+  process.env.CLAUDE_OAUTH_CLIENT_ID_OVERRIDE ?? "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_TOKEN_URL_PRIMARY =
+  process.env.CLAUDE_REFRESH_TOKEN_URL_OVERRIDE ?? "https://platform.claude.com/v1/oauth/token";
+const CLAUDE_TOKEN_URL_LEGACY = "https://console.anthropic.com/v1/oauth/token";
+const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
+// Proactive refresh threshold (5 min, same as Google/Codex skew)
+const CLAUDE_REFRESH_SKEW_MS = 5 * 60 * 1000;
+
+type ClaudeOAuthBlock = {
+  accessToken?: string;
+  refreshToken?: string;
+  expiresAt?: number; // ms epoch
+  refreshTokenExpiresAt?: number; // ms epoch
+  scopes?: unknown;
+  subscriptionType?: unknown;
+  rateLimitTier?: unknown;
+  [k: string]: unknown;
+};
+
+type ClaudeStore = {
+  data: Record<string, unknown> & { claudeAiOauth?: ClaudeOAuthBlock };
+  source: "keychain" | "file";
+  filePath?: string;
+};
+
+function getClaudeCredentialsFilePath(): string {
+  return `${process.env.HOME ?? "."}/.claude/.credentials.json`;
+}
+
+async function readClaudeKeychainJson(): Promise<Record<string, unknown> | null> {
+  const user = process.env.USER;
+  if (!user) return null;
+  try {
+    const proc = Bun.spawn(
+      ["security", "find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-a", user, "-w"],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const raw = await new Response(proc.stdout).text();
+    const exitCode = await proc.exited;
+    if (exitCode !== 0) return null;
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    if (trimmed.startsWith("sk-ant-")) return { __rawToken: trimmed } as Record<string, unknown>;
+    try {
+      return JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+async function readClaudeCredentialsFile(): Promise<{ data: Record<string, unknown>; path: string } | null> {
+  const candidates = [
+    getClaudeCredentialsFilePath(),
+    `${process.env.HOME ?? "."}/.claude/.credentials.json`,
+  ];
+  const seen = new Set<string>();
+  for (const p of candidates) {
+    if (seen.has(p)) continue;
+    seen.add(p);
+    try {
+      const file = Bun.file(p);
+      if (await file.exists()) {
+        const json = (await file.json()) as Record<string, unknown>;
+        if (json?.claudeAiOauth || (json as Record<string, unknown>).__rawToken) return { data: json, path: p };
+        // Raw token file (setup-token persisted as plain text JSON string)?
+        if (typeof (json as unknown) === "string") return { data: { __rawToken: json as unknown as string }, path: p };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function readClaudeStore(): Promise<ClaudeStore | null> {
+  const kc = await readClaudeKeychainJson();
+  if (kc) {
+    if (typeof kc.__rawToken === "string") return { data: kc, source: "keychain" };
+    if ((kc as Record<string, unknown>).claudeAiOauth) return { data: kc as ClaudeStore["data"], source: "keychain" };
+  }
+  const f = await readClaudeCredentialsFile();
+  if (f) return { data: f.data as ClaudeStore["data"], source: "file", filePath: f.path };
+  // Keychain exists but unparseable as JSON (e.g. plain sk-ant-... without JSON wrapper handled above) -> already returned
+  return kc ? { data: kc as ClaudeStore["data"], source: "keychain" } : null;
+}
+
+async function writeClaudeStore(store: ClaudeStore): Promise<void> {
+  if (store.source === "file" && store.filePath) {
+    await Bun.write(store.filePath, JSON.stringify(store.data, null, 2));
+    const chmod = Bun.spawn(["chmod", "600", store.filePath], { stdout: "pipe", stderr: "pipe" });
+    await chmod.exited;
+    return;
+  }
+  // keychain
+  const user = process.env.USER;
+  if (!user) throw new Error("USER env var is not set; cannot write keychain");
+  const payload =
+    typeof (store.data as Record<string, unknown>).__rawToken === "string"
+      ? String((store.data as Record<string, unknown>).__rawToken)
+      : JSON.stringify(store.data);
+  const proc = Bun.spawn(
+    ["security", "add-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-a", user, "-w", payload, "-U"],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
+    const errText = await new Response(proc.stderr).text();
+    throw new Error(`Failed to write Claude Code credentials to Keychain (exit ${exitCode}): ${errText.trim()}`);
+  }
+}
+
+function isClaudeExpiringSoon(expiresAt: number | null | undefined, skewMs = CLAUDE_REFRESH_SKEW_MS): boolean {
+  if (expiresAt == null) return false;
+  return expiresAt - Date.now() < skewMs;
+}
+
+export async function refreshClaudeAccessToken(
+  refreshToken: string,
+): Promise<{ access_token: string; refresh_token?: string; expires_in?: number }> {
+  const body = JSON.stringify({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: CLAUDE_CLIENT_ID,
+  });
+  const urls = [CLAUDE_TOKEN_URL_PRIMARY, CLAUDE_TOKEN_URL_LEGACY];
+  let lastError: Error | null = null;
+  for (let i = 0; i < urls.length; i++) {
+    const url = urls[i]!;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": "claude-cli/2.1.74 (external, cli)",
+      },
+      body,
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
+      if (!data.access_token) throw new Error("Claude refresh response missing access_token");
+      return { access_token: data.access_token, refresh_token: data.refresh_token, expires_in: data.expires_in };
+    }
+    const text = await res.text();
+    // Fallback to legacy only on moved endpoint (404/405). 400/401 = invalid_grant (stale/rotated) -> do not retry other host.
+    if (res.status === 404 || res.status === 405) {
+      lastError = new Error(`Claude token refresh failed: ${res.status} ${text}`);
+      continue;
+    }
+    throw new Error(`Claude token refresh failed: ${res.status} ${text}`);
+  }
+  throw lastError ?? new Error("Claude token refresh failed at all endpoints");
+}
+
+async function refreshAndPersistClaudeToken(store: ClaudeStore, reason: string): Promise<string | null> {
+  const oauth = store.data.claudeAiOauth;
+  const refreshToken = oauth?.refreshToken;
+  if (!refreshToken) return null;
+  // Refresh token itself expired -> must re-login
+  if (oauth?.refreshTokenExpiresAt && oauth.refreshTokenExpiresAt <= Date.now()) {
+    throw new Error(
+      "Claude refresh token has expired. Please re-authenticate with `claude login` (/login).",
+    );
+  }
+  // Re-read latest store to avoid racing with a concurrent `claude` process that already rotated the token
+  const latest = await readClaudeStore();
+  const latestOauth = latest?.data.claudeAiOauth;
+  if (latest && latestOauth?.accessToken && latestOauth.accessToken !== oauth?.accessToken) {
+    if (!isClaudeExpiringSoon(latestOauth.expiresAt)) {
+      return latestOauth.accessToken;
+    }
+    store = latest;
+  }
+  console.log(`[claude] Access token ${reason}, refreshing...`);
+  const refreshed = await refreshClaudeAccessToken(refreshToken);
+  const updated: ClaudeStore = {
+    ...store,
+    data: {
+      ...store.data,
+      claudeAiOauth: {
+        ...store.data.claudeAiOauth,
+        accessToken: refreshed.access_token,
+        ...(refreshed.refresh_token ? { refreshToken: refreshed.refresh_token } : {}),
+        ...(refreshed.expires_in ? { expiresAt: Date.now() + refreshed.expires_in * 1000 } : {}),
+      },
+    },
+  };
+  await writeClaudeStore(updated);
+  console.log("[claude] Token refreshed and saved");
+  return refreshed.access_token;
+}
+
 export async function getClaudeToken(): Promise<string> {
   const envToken =
     process.env.CLAUDE_CODE_OAUTH_TOKEN ??
@@ -103,35 +296,36 @@ export async function getClaudeToken(): Promise<string> {
     process.env.CLAUDE_TOKEN;
   if (envToken) return envToken.trim();
 
-  const user = process.env.USER;
-  if (!user) throw new Error("USER env var is not set; cannot read keychain");
-
-  const proc = Bun.spawn(
-    ["security", "find-generic-password", "-s", "Claude Code-credentials", "-a", user, "-w"],
-    { stdout: "pipe", stderr: "pipe" },
-  );
-  const raw = await new Response(proc.stdout).text();
-  const exitCode = await proc.exited;
-  if (exitCode !== 0) {
-    const errText = await new Response(proc.stderr).text();
+  const store = await readClaudeStore();
+  if (!store) {
+    const user = process.env.USER;
     throw new Error(
-      `Could not read Claude Code credentials from Keychain (exit ${exitCode}): ${errText.trim() || raw.trim() || "no output"}. ` +
-        `Try setting CLAUDE_CODE_OAUTH_TOKEN env var or ensure Claude Code is logged in.`,
+      `Could not read Claude Code credentials from Keychain${user ? "" : " (USER env var is not set)"} or ${getClaudeCredentialsFilePath()}. ` +
+        `Try setting CLAUDE_CODE_OAUTH_TOKEN env var or ensure Claude Code is logged in (claude login).`,
     );
   }
-  const trimmed = raw.trim();
-  if (!trimmed) throw new Error("Keychain returned empty credentials");
+  const rawToken = (store.data as Record<string, unknown>).__rawToken;
+  if (typeof rawToken === "string" && rawToken.startsWith("sk-ant-")) return rawToken.trim();
 
-  try {
-    const parsed = JSON.parse(trimmed);
-    const token = parsed?.claudeAiOauth?.accessToken;
-    if (typeof token === "string" && token.length > 0) return token;
-    if (typeof parsed === "string" && parsed.startsWith("sk-ant-")) return parsed;
-    throw new Error("claudeAiOauth.accessToken not found in keychain JSON");
-  } catch (e) {
-    if (trimmed.startsWith("sk-ant-")) return trimmed;
-    throw e;
+  const oauth = store.data.claudeAiOauth;
+  const token = oauth?.accessToken;
+  if (typeof token !== "string" || token.length === 0) {
+    throw new Error("claudeAiOauth.accessToken not found in Claude credentials (keychain/file)");
   }
+
+  // Proactive refresh if expiring soon and refresh_token available (setup-tokens have no refresh_token -> skip)
+  if (oauth?.refreshToken && isClaudeExpiringSoon(oauth.expiresAt)) {
+    try {
+      const refreshed = await refreshAndPersistClaudeToken(store, "expiring soon");
+      if (refreshed) return refreshed;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // invalid_grant = rotated/revoked by another process -> surface re-login hint, keep old token as fallback
+      console.warn(`[claude] Proactive refresh failed: ${msg}, using existing token`);
+      if (msg.includes("expired") && msg.includes("re-authenticate")) throw e;
+    }
+  }
+  return token;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,17 +491,55 @@ export async function getCodexAccountId(): Promise<string | null> {
 // ---------------------------------------------------------------------------
 
 export async function getClaudeUsage(token: string): Promise<ClaudeUsage> {
-  const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`usage fetch failed: ${res.status} ${body}`);
+  const attemptFetch = async (tok: string): Promise<ClaudeUsage> => {
+    const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        Authorization: `Bearer ${tok}`,
+        "Content-Type": "application/json",
+      },
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`usage fetch failed: ${res.status} ${body}`);
+    }
+    return (await res.json()) as ClaudeUsage;
+  };
+
+  try {
+    return await attemptFetch(token);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const isAuthError =
+      msg.includes("401") || msg.includes("403") || msg.toLowerCase().includes("authentication_error") || msg.toLowerCase().includes("expired");
+    if (!isAuthError) throw e;
+    // Env tokens (e.g. `claude setup-token`) have no refresh_token -> cannot auto-refresh
+    const hasEnvToken =
+      process.env.CLAUDE_CODE_OAUTH_TOKEN ?? process.env.ANTHROPIC_OAUTH_TOKEN ?? process.env.CLAUDE_TOKEN;
+    if (hasEnvToken && hasEnvToken.trim() === token.trim()) throw e;
+    // Try refresh flow if we have a refresh_token in keychain/file
+    const store = await readClaudeStore();
+    if (!store?.data.claudeAiOauth?.refreshToken) throw e;
+    // Avoid redundant refresh if the store already holds a different (rotated) token
+    const storedAccess = store.data.claudeAiOauth.accessToken;
+    if (storedAccess && storedAccess !== token && !isClaudeExpiringSoon(store.data.claudeAiOauth.expiresAt, 0)) {
+      console.log("[claude] Usage fetch auth failed, retrying with stored credentials...");
+      return await attemptFetch(storedAccess);
+    }
+    console.log("[claude] Usage fetch auth failed, attempting token refresh...");
+    try {
+      const refreshed = await refreshAndPersistClaudeToken(store, "expired (401)");
+      if (!refreshed) throw e;
+      return await attemptFetch(refreshed);
+    } catch (refreshErr) {
+      const rmsg = refreshErr instanceof Error ? refreshErr.message : String(refreshErr);
+      console.warn(`[claude] Refresh after 401 failed: ${rmsg}`);
+      // If refresh token itself is invalid/expired, surface re-login hint
+      if (rmsg.includes("invalid_grant") || rmsg.includes("400") || rmsg.includes("re-authenticate")) {
+        throw new Error(`${msg} (refresh failed: ${rmsg}. Please run \`claude login\` to re-authenticate)`);
+      }
+      throw e;
+    }
   }
-  return (await res.json()) as ClaudeUsage;
 }
 
 function codexEpochToIso(epoch: number | null | undefined): string | null {
@@ -1449,7 +1681,9 @@ Options:
   -h, --help                      Show this help
 
 Env:
-  CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_OAUTH_TOKEN / CLAUDE_TOKEN  Override claude keychain token
+  CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_OAUTH_TOKEN / CLAUDE_TOKEN  Override claude keychain token (setup-token: no auto-refresh)
+  CLAUDE_REFRESH_TOKEN_URL_OVERRIDE  Override Claude refresh endpoint (default https://platform.claude.com/v1/oauth/token)
+  CLAUDE_OAUTH_CLIENT_ID_OVERRIDE    Override Claude OAuth client_id
   CODEX_ACCESS_TOKEN / OPENAI_CODEX_ACCESS_TOKEN / CODEX_BEARER_TOKEN  Override Codex token (else ~/.codex/auth.json)
   CODEX_HOME                      Path to Codex home (default ~/.codex)
   CHATGPT_ACCOUNT_ID              Override Codex account ID
